@@ -8,14 +8,20 @@ from datetime import datetime, timedelta
 from db import init_database
 from services import (
     CourseService, RegistrationService, AttendanceService,
-    ExportService, ExceptionService, ValidationError
+    ExportService, ExceptionService, BatchOperationService,
+    UndoManager, ValidationError
 )
+from db.dao import RegistrationDAO, BatchOperationLogDAO, BatchOperationItemDAO
 
 try:
     from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget, QFileDialog, QDialog
     from PySide6.QtCore import Qt
     from ui.widgets import CourseDetailWidget
-    from ui.dialogs import BatchImportResultDialog
+    from ui.dialogs import (
+        BatchImportResultDialog, BatchOperationConfirmDialog,
+        BatchOperationResultDialog, BatchTargetCourseDialog,
+        BatchTargetStatusDialog, UndoDialog
+    )
     PYSIDE_AVAILABLE = True
 except ImportError:
     PYSIDE_AVAILABLE = False
@@ -1198,6 +1204,1011 @@ def test_gui_import_persistence_after_restart():
         if app:
             app.processEvents()
 
+def test_batch_cancel_partial_failure():
+    print('\n=== 测试批量取消（部分成功部分失败） ===')
+
+    course_data = {
+        'title': '批量取消测试课程',
+        'theme': '批量操作',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    students = [
+        {'name': '取消学生1', 'employee_id': 'CANCEL001', 'department': '技术部'},
+        {'name': '取消学生2', 'employee_id': 'CANCEL002', 'department': '产品部'},
+        {'name': '取消学生3', 'employee_id': 'CANCEL003', 'department': '运营部'},
+    ]
+
+    reg_ids = []
+    for s in students:
+        reg_id = RegistrationService.register_student(course_id, s)
+        reg_ids.append(reg_id)
+
+    RegistrationService.cancel_registration(reg_ids[1])
+
+    all_reg_ids = reg_ids + [99999]
+
+    try:
+        result = BatchOperationService.batch_cancel(course_id, all_reg_ids)
+        assert result['total_count'] == 4, f'期望4条，实际{result["total_count"]}'
+        assert result['success_count'] == 2, f'期望成功2条，实际{result["success_count"]}'
+        assert result['failure_count'] == 2, f'期望失败2条，实际{result["failure_count"]}'
+        print_test('批量取消部分成功', True, f'成功{result["success_count"]}/失败{result["failure_count"]}')
+
+        failure_items = [item for item in result['items'] if not item['success']]
+        assert len(failure_items) == 2
+        failure_reasons = [item['failure_reason'] for item in failure_items]
+        assert any('已取消' in r for r in failure_reasons)
+        assert any('不存在' in r for r in failure_reasons)
+        print_test('失败原因正确记录', True, f'原因: {failure_reasons}')
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        active_regs = [r for r in regs if r['status'] == 'registered']
+        assert len(active_regs) == 1, f'期望1条有效报名，实际{len(active_regs)}'
+        print_test('仅成功记录状态更新', True)
+
+        logs = ExceptionService.get_all_logs()
+        batch_logs = [l for l in logs if l['type'] == 'batch_operation_failure']
+        assert len(batch_logs) >= 2, f'期望至少2条异常日志，实际{len(batch_logs)}'
+        print_test('失败记录写入异常日志', True, f'共{len(batch_logs)}条')
+
+        return result
+    except Exception as e:
+        print_test('批量取消部分成功', False, str(e))
+        return None
+
+def test_batch_change_status():
+    print('\n=== 测试批量改状态 ===')
+
+    course_data = {
+        'title': '批量改状态测试课程',
+        'theme': '批量操作',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    students = [
+        {'name': '状态学生1', 'employee_id': 'STATUS001', 'department': '技术部'},
+        {'name': '状态学生2', 'employee_id': 'STATUS002', 'department': '产品部'},
+        {'name': '状态学生3', 'employee_id': 'STATUS003', 'department': '运营部'},
+    ]
+
+    reg_ids = []
+    for s in students:
+        reg_id = RegistrationService.register_student(course_id, s)
+        reg_ids.append(reg_id)
+
+    RegistrationService.cancel_registration(reg_ids[2])
+
+    try:
+        result = BatchOperationService.batch_change_status(
+            course_id, reg_ids, 'attended'
+        )
+        assert result['total_count'] == 3
+        assert result['success_count'] == 2
+        assert result['failure_count'] == 1
+        print_test('批量改状态部分成功', True, f'成功{result["success_count"]}/失败{result["failure_count"]}')
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        status_map = {r['employee_id']: r['status'] for r in regs}
+        assert status_map['STATUS001'] == 'attended'
+        assert status_map['STATUS002'] == 'attended'
+        assert status_map['STATUS003'] == 'cancelled'
+        print_test('状态更新正确', True)
+
+        return result
+    except Exception as e:
+        print_test('批量改状态', False, str(e))
+        return None
+
+def test_batch_transfer_rules():
+    print('\n=== 测试批量调课业务规则 ===')
+
+    course1_data = {
+        'title': '批量调课源课程',
+        'theme': '批量操作',
+        'instructor': '测试讲师',
+        'venue': '测试场地A',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course1_id = CourseService.create_course(course1_data)
+
+    course2_data = {
+        'title': '批量调课目标课程（同主题）',
+        'theme': '批量操作',
+        'instructor': '测试讲师',
+        'venue': '测试场地B',
+        'start_time': (datetime.now() + timedelta(days=14)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=14, hours=3)).isoformat(),
+        'capacity': 3,
+        'registration_deadline': (datetime.now() + timedelta(days=13)).isoformat(),
+        'status': 'published'
+    }
+    course2_id = CourseService.create_course(course2_data)
+
+    course3_data = {
+        'title': '不同主题课程',
+        'theme': '其他主题',
+        'instructor': '测试讲师',
+        'venue': '测试场地C',
+        'start_time': (datetime.now() + timedelta(days=21)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=21, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=20)).isoformat(),
+        'status': 'published'
+    }
+    course3_id = CourseService.create_course(course3_data)
+
+    students = [
+        {'name': '调课学生1', 'employee_id': 'TRANS001', 'department': '技术部'},
+        {'name': '调课学生2', 'employee_id': 'TRANS002', 'department': '产品部'},
+        {'name': '调课学生3', 'employee_id': 'TRANS003', 'department': '运营部'},
+        {'name': '调课学生4', 'employee_id': 'TRANS004', 'department': '市场部'},
+        {'name': '调课学生5', 'employee_id': 'TRANS005', 'department': '财务部'},
+    ]
+
+    reg_ids = []
+    for s in students:
+        reg_id = RegistrationService.register_student(course1_id, s)
+        reg_ids.append(reg_id)
+
+    RegistrationService.cancel_registration(reg_ids[4])
+
+    RegistrationService.register_student(course2_id, {
+        'name': '重复学生', 'employee_id': 'TRANS003', 'department': '运营部'
+    })
+
+    try:
+        result_same_theme = BatchOperationService.batch_transfer(
+            course1_id, reg_ids, course2_id
+        )
+        assert result_same_theme['total_count'] == 5
+        assert result_same_theme['success_count'] == 2
+        assert result_same_theme['failure_count'] == 3
+        print_test('批量调课容量和重复拦截', True,
+            f'成功{result_same_theme["success_count"]}/失败{result_same_theme["failure_count"]}')
+
+        failure_items = [item for item in result_same_theme['items'] if not item['success']]
+        failure_reasons = [item['failure_reason'] for item in failure_items]
+        assert any('重复' in r for r in failure_reasons)
+        assert any('已取消' in r for r in failure_reasons)
+        assert any('容量' in r for r in failure_reasons)
+        print_test('调课拦截原因正确', True, f'原因: {failure_reasons}')
+
+        try:
+            BatchOperationService.batch_transfer(course1_id, [reg_ids[0]], course3_id)
+            print_test('非同主题调课拦截', False, '应该抛出异常')
+        except ValidationError as e:
+            print_test('非同主题调课拦截', True, str(e))
+
+        course2_regs = RegistrationService.get_course_registrations(course2_id)
+        course2_count = len([r for r in course2_regs if r['status'] == 'registered'])
+        assert course2_count == 3, f'目标课程容量应为3，实际{course2_count}'
+        print_test('目标课程容量占用正确', True, f'{course2_count}/3')
+
+        return result_same_theme
+    except Exception as e:
+        print_test('批量调课业务规则', False, str(e))
+        return None
+
+def test_batch_operation_preview():
+    print('\n=== 测试批量操作预览 ===')
+
+    course_data = {
+        'title': '预览测试课程',
+        'theme': '预览测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    students = [
+        {'name': '预览学生1', 'employee_id': 'PREVIEW001', 'department': '技术部'},
+        {'name': '预览学生2', 'employee_id': 'PREVIEW002', 'department': '产品部'},
+    ]
+
+    reg_ids = []
+    for s in students:
+        reg_id = RegistrationService.register_student(course_id, s)
+        reg_ids.append(reg_id)
+
+    RegistrationService.cancel_registration(reg_ids[1])
+
+    try:
+        preview = BatchOperationService.get_preview(course_id, reg_ids, 'cancel')
+        assert preview['total_count'] == 2
+        assert len(preview['warnings']) > 0
+        print_test('批量取消预览正确', True, f'警告: {preview["warnings"]}')
+
+        assert len(preview['registrations']) == 2
+        print_test('预览包含学员信息', True)
+
+        preview_status = BatchOperationService.get_preview(
+            course_id, reg_ids, 'change_status', target_status='attended'
+        )
+        assert preview_status['target_status'] == 'attended'
+        print_test('批量改状态预览正确', True)
+    except Exception as e:
+        print_test('批量操作预览', False, str(e))
+
+def test_undo_cancel_operation():
+    print('\n=== 测试撤销批量取消 ===')
+
+    course_data = {
+        'title': '撤销测试课程',
+        'theme': '撤销测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    students = [
+        {'name': '撤销学生1', 'employee_id': 'UNDO001', 'department': '技术部'},
+        {'name': '撤销学生2', 'employee_id': 'UNDO002', 'department': '产品部'},
+        {'name': '撤销学生3', 'employee_id': 'UNDO003', 'department': '运营部'},
+    ]
+
+    reg_ids = []
+    for s in students:
+        reg_id = RegistrationService.register_student(course_id, s)
+        reg_ids.append(reg_id)
+
+    try:
+        result = BatchOperationService.batch_cancel(course_id, reg_ids)
+        assert result['success_count'] == 3
+
+        regs_after_cancel = RegistrationService.get_course_registrations(course_id)
+        cancelled_count = len([r for r in regs_after_cancel if r['status'] == 'cancelled'])
+        assert cancelled_count == 3
+        print_test('批量取消执行成功', True)
+
+        assert UndoManager.has_undo_available(), '撤销应该可用'
+        undo_info = UndoManager.get_last_undo_info()
+        assert undo_info is not None
+        assert undo_info['operation_type'] == 'cancel'
+        assert undo_info['success_count'] == 3
+        print_test('撤销信息正确', True)
+
+        undo_result = UndoManager.undo_last_operation()
+        assert undo_result is not None
+        assert undo_result['restored_count'] == 3
+        print_test('撤销操作成功', True, f'恢复{undo_result["restored_count"]}条')
+
+        regs_after_undo = RegistrationService.get_course_registrations(course_id)
+        active_count = len([r for r in regs_after_undo if r['status'] == 'registered'])
+        assert active_count == 3, f'撤销后期望3条有效报名，实际{active_count}'
+        print_test('撤销后状态恢复正确', True)
+
+        course = CourseService.get_course(course_id)
+        registered_count = len([r for r in regs_after_undo if r['status'] == 'registered'])
+        assert registered_count <= course['capacity']
+        print_test('撤销后容量占用正确', True, f'{registered_count}/{course["capacity"]}')
+
+        assert not UndoManager.has_undo_available(), '撤销后不应再可用'
+        print_test('撤销后清除撤销状态', True)
+
+        return undo_result
+    except Exception as e:
+        print_test('撤销批量取消', False, str(e))
+        return None
+
+def test_undo_transfer_operation():
+    print('\n=== 测试撤销批量调课 ===')
+
+    course1_data = {
+        'title': '撤销调课源课程',
+        'theme': '撤销调课',
+        'instructor': '测试讲师',
+        'venue': '测试场地A',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course1_id = CourseService.create_course(course1_data)
+
+    course2_data = {
+        'title': '撤销调课目标课程',
+        'theme': '撤销调课',
+        'instructor': '测试讲师',
+        'venue': '测试场地B',
+        'start_time': (datetime.now() + timedelta(days=14)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=14, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=13)).isoformat(),
+        'status': 'published'
+    }
+    course2_id = CourseService.create_course(course2_data)
+
+    students = [
+        {'name': '撤销调课1', 'employee_id': 'UNDOTR001', 'department': '技术部'},
+        {'name': '撤销调课2', 'employee_id': 'UNDOTR002', 'department': '产品部'},
+    ]
+
+    reg_ids = []
+    for s in students:
+        reg_id = RegistrationService.register_student(course1_id, s)
+        reg_ids.append(reg_id)
+
+    try:
+        result = BatchOperationService.batch_transfer(course1_id, reg_ids, course2_id)
+        assert result['success_count'] == 2
+        print_test('批量调课执行成功', True)
+
+        course2_regs = RegistrationService.get_course_registrations(course2_id)
+        course2_count = len([r for r in course2_regs if r['status'] == 'registered'])
+        assert course2_count == 2
+        print_test('目标课程报名增加', True)
+
+        course1_regs = RegistrationService.get_course_registrations(course1_id)
+        course1_count = len([r for r in course1_regs if r['status'] == 'registered'])
+        assert course1_count == 0
+        print_test('源课程报名减少', True)
+
+        undo_result = UndoManager.undo_last_operation()
+        assert undo_result is not None
+        assert undo_result['restored_count'] == 2
+        print_test('撤销调课成功', True)
+
+        course2_regs_after = RegistrationService.get_course_registrations(course2_id)
+        course2_count_after = len([r for r in course2_regs_after if r['status'] == 'registered'])
+        assert course2_count_after == 0, f'撤销后期望目标课程0人，实际{course2_count_after}'
+
+        course1_regs_after = RegistrationService.get_course_registrations(course1_id)
+        course1_count_after = len([r for r in course1_regs_after if r['status'] == 'registered'])
+        assert course1_count_after == 2, f'撤销后期望源课程2人，实际{course1_count_after}'
+        print_test('撤销后两门课程人数恢复', True)
+
+        return undo_result
+    except Exception as e:
+        print_test('撤销批量调课', False, str(e))
+        return None
+
+def test_undo_session_boundary():
+    print('\n=== 测试撤销会话边界 ===')
+
+    old_session_start = UndoManager._session_start
+
+    try:
+        UndoManager._session_start = datetime.now() - timedelta(hours=2)
+        UndoManager._last_batch_log_id = None
+
+        assert not UndoManager.has_undo_available()
+        print_test('重启后撤销不可用', True)
+
+        undo_info = UndoManager.get_last_undo_info()
+        assert undo_info is None
+        print_test('重启后无撤销信息', True)
+
+        undo_result = UndoManager.undo_last_operation()
+        assert undo_result is None
+        print_test('重启后无法执行撤销', True)
+    finally:
+        UndoManager._session_start = old_session_start
+
+def test_batch_operation_persistence():
+    print('\n=== 测试批量操作持久化（重启后验证） ===')
+
+    course_data = {
+        'title': '持久化批量操作课程',
+        'theme': '持久化测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    students = [
+        {'name': '持久学生1', 'employee_id': 'PERBATCH001', 'department': '技术部'},
+        {'name': '持久学生2', 'employee_id': 'PERBATCH002', 'department': '产品部'},
+        {'name': '持久学生3', 'employee_id': 'PERBATCH003', 'department': '运营部'},
+    ]
+
+    reg_ids = []
+    for s in students:
+        reg_id = RegistrationService.register_student(course_id, s)
+        reg_ids.append(reg_id)
+
+    RegistrationService.cancel_registration(reg_ids[1])
+
+    result = BatchOperationService.batch_cancel(course_id, reg_ids)
+    assert result['success_count'] == 2
+
+    logs_before = BatchOperationLogDAO.get_latest(limit=5)
+    log_count_before = len(logs_before)
+    items_before = BatchOperationItemDAO.get_successful_by_batch_log(result['batch_log_id'])
+    item_count_before = len(items_before)
+
+    print('--- 模拟程序关闭后重启 ---')
+    from db.database import init_database
+    init_database()
+
+    logs_after = BatchOperationLogDAO.get_latest(limit=5)
+    log_count_after = len(logs_after)
+    assert log_count_after == log_count_before
+    print_test('重启后批量操作日志完整', True, f'共{log_count_after}条')
+
+    items_after = BatchOperationItemDAO.get_successful_by_batch_log(result['batch_log_id'])
+    item_count_after = len(items_after)
+    assert item_count_after == item_count_before
+    print_test('重启后批量操作明细完整', True, f'共{item_count_after}条')
+
+    regs_after = RegistrationService.get_course_registrations(course_id)
+    status_map = {r['employee_id']: r['status'] for r in regs_after}
+    assert status_map['PERBATCH001'] == 'cancelled'
+    assert status_map['PERBATCH002'] == 'cancelled'
+    assert status_map['PERBATCH003'] == 'cancelled'
+    print_test('重启后报名状态正确', True)
+
+    exception_logs = ExceptionService.get_all_logs()
+    batch_failures = [l for l in exception_logs if l['type'] == 'batch_operation_failure']
+    assert len(batch_failures) >= 1
+    print_test('重启后异常日志完整', True, f'共{len(batch_failures)}条失败记录')
+
+def test_batch_operation_export():
+    print('\n=== 测试批量操作结果导出 ===')
+
+    course1_data = {
+        'title': '导出源课程',
+        'theme': '导出测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地A',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course1_id = CourseService.create_course(course1_data)
+
+    course2_data = {
+        'title': '导出目标课程',
+        'theme': '导出测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地B',
+        'start_time': (datetime.now() + timedelta(days=14)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=14, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=13)).isoformat(),
+        'status': 'published'
+    }
+    course2_id = CourseService.create_course(course2_data)
+
+    students = [
+        {'name': '导出学生1', 'employee_id': 'EXPBATCH001', 'department': '技术部', 'phone': '13800000001'},
+        {'name': '导出学生2', 'employee_id': 'EXPBATCH002', 'department': '产品部', 'phone': '13800000002'},
+        {'name': '导出学生3', 'employee_id': 'EXPBATCH003', 'department': '运营部', 'phone': '13800000003'},
+    ]
+
+    reg_ids = []
+    for s in students:
+        reg_id = RegistrationService.register_student(course1_id, s)
+        reg_ids.append(reg_id)
+
+    RegistrationService.cancel_registration(reg_ids[2])
+
+    result = BatchOperationService.batch_transfer(course1_id, reg_ids, course2_id)
+
+    try:
+        export_path = ExportService.export_batch_operation_result(result)
+        assert os.path.exists(export_path), '导出文件不存在'
+        print_test('批量调课结果CSV生成', True, f'文件: {export_path}')
+
+        with open(export_path, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+
+        assert '批量操作结果' in content
+        assert 'EXPBATCH001' in content
+        assert 'EXPBATCH002' in content
+        assert 'EXPBATCH003' in content
+        assert '成功' in content
+        assert '失败' in content
+        assert '已取消' in content
+        print_test('导出CSV包含正确内容', True)
+
+        assert '原课程' in content
+        assert '目标课程' in content
+        assert '处理结果' in content
+        assert '失败原因' in content
+        print_test('导出CSV包含正确表头', True)
+
+        success_count = content.count(',成功,') + content.count('"成功"')
+        failure_count = content.count(',失败,') + content.count('"失败"')
+        assert success_count >= 2, f'成功记录数不足'
+        assert failure_count >= 1, f'失败记录数不足'
+        print_test('导出CSV包含成功/失败标记', True, f'成功{success_count}条，失败{failure_count}条')
+
+        assert '导出目标课程' in content
+        assert '导出源课程' in content
+        print_test('导出CSV包含课程信息', True)
+
+        return export_path
+    except Exception as e:
+        print_test('批量操作结果导出', False, str(e))
+        return None
+
+def test_gui_batch_operation_buttons():
+    print('\n=== 测试 GUI 批量操作按钮 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    course_data = {
+        'title': 'GUI 批量操作测试',
+        'theme': 'GUI 测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    try:
+        widget = CourseDetailWidget(course_id)
+        widget.show()
+        app.processEvents()
+
+        buttons_found = {}
+        expected_buttons = ['批量取消', '批量改状态', '批量调课', '全选']
+        for btn_text in expected_buttons:
+            found = False
+            for child in widget.findChildren(QPushButton):
+                if child.text() == btn_text:
+                    assert child.isVisible(), f'FAIL: {btn_text} 按钮不可见'
+                    assert child.isEnabled(), f'FAIL: {btn_text} 按钮不可用'
+                    buttons_found[btn_text] = True
+                    found = True
+                    break
+            for child in widget.findChildren(QCheckBox):
+                if child.text() == btn_text:
+                    assert child.isVisible(), f'FAIL: {btn_text} 复选框不可见'
+                    buttons_found[btn_text] = True
+                    found = True
+                    break
+            assert found, f'FAIL: 未找到 {btn_text} 控件'
+
+        print_test('课程详情页有所有批量操作控件', True, list(buttons_found.keys()))
+
+        table = widget.reg_table
+        assert table.columnCount() == 7
+        headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+        assert '选择' in headers
+        assert '工号' in headers
+        assert '姓名' in headers
+        print_test('报名表格包含选择列', True, f'表头: {headers}')
+
+        assert hasattr(widget, 'selected_registrations')
+        assert hasattr(widget, 'select_all_checkbox')
+        assert hasattr(widget, 'selection_label')
+        print_test('批量选择属性存在', True)
+
+        widget.close()
+    finally:
+        if app:
+            app.processEvents()
+
+def test_gui_undo_button():
+    print('\n=== 测试 GUI 撤销入口 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    from ui.main_window import MainWindow
+
+    try:
+        window = MainWindow()
+        window.show()
+        app.processEvents()
+
+        undo_action = None
+        for action in window.toolbar.actions():
+            if '撤销' in action.text():
+                undo_action = action
+                break
+
+        assert undo_action is not None, 'FAIL: 未找到撤销按钮'
+        assert undo_action.shortcut().toString() == 'Ctrl+Z'
+        print_test('主工具栏有撤销按钮', True, f'快捷键: {undo_action.shortcut().toString()}')
+
+        assert hasattr(window, 'undo_status_label')
+        print_test('有撤销状态标签', True)
+
+        assert not undo_action.isEnabled(), 'FAIL: 无操作时撤销按钮应禁用'
+        print_test('无操作时撤销按钮禁用', True)
+
+        window.close()
+    finally:
+        if app:
+            app.processEvents()
+
+def test_gui_batch_dialogs():
+    print('\n=== 测试 GUI 批量操作对话框 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    try:
+        preview_data = {
+            'course_title': '对话框测试课程',
+            'total_count': 3,
+            'warnings': ['学员 测试学生2 已取消，将跳过'],
+            'registrations': [
+                {'employee_id': 'DIALOG001', 'name': '对话框学生1', 'status': 'registered', 'department': '技术部'},
+                {'employee_id': 'DIALOG002', 'name': '对话框学生2', 'status': 'cancelled', 'department': '产品部'},
+                {'employee_id': 'DIALOG003', 'name': '对话框学生3', 'status': 'registered', 'department': '运营部'},
+            ]
+        }
+
+        confirm_dialog = BatchOperationConfirmDialog(preview_data, 'cancel')
+        confirm_dialog.show()
+        app.processEvents()
+
+        table = confirm_dialog.findChild(QTableWidget)
+        assert table is not None
+        assert table.rowCount() == 3
+        print_test('确认对话框含学员列表', True, f'{table.rowCount()}行')
+
+        headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+        assert '工号' in headers
+        assert '姓名' in headers
+        assert '当前状态' in headers
+        assert '操作' in headers
+        print_test('确认对话框表头正确', True)
+
+        confirm_dialog.close()
+
+        result_data = {
+            'batch_log_id': 1,
+            'total_count': 3,
+            'success_count': 2,
+            'failure_count': 1,
+            'items': [
+                {'employee_id': 'DIALOG001', 'name': '对话框学生1', 'department': '技术部', 'success': True, 'failure_reason': ''},
+                {'employee_id': 'DIALOG002', 'name': '对话框学生2', 'department': '产品部', 'success': False, 'failure_reason': '已取消报名，无法操作'},
+                {'employee_id': 'DIALOG003', 'name': '对话框学生3', 'department': '运营部', 'success': True, 'failure_reason': ''},
+            ]
+        }
+
+        result_dialog = BatchOperationResultDialog(result_data, 'cancel')
+        result_dialog.show()
+        app.processEvents()
+
+        result_table = result_dialog.findChild(QTableWidget)
+        assert result_table is not None
+        assert result_table.rowCount() == 3
+
+        success_count = 0
+        failure_count = 0
+        for row in range(result_table.rowCount()):
+            item = result_table.item(row, 4)
+            if item and '成功' in item.text():
+                success_count += 1
+            elif item and '失败' in item.text():
+                failure_count += 1
+
+        assert success_count == 2
+        assert failure_count == 1
+        print_test('结果对话框显示正确的成功/失败', True, f'成功{success_count}/失败{failure_count}')
+
+        result_dialog.close()
+
+        undo_dialog = UndoDialog()
+        undo_dialog.show()
+        app.processEvents()
+        undo_dialog.close()
+        print_test('撤销对话框可正常创建', True)
+
+    except Exception as e:
+        print_test('GUI 批量操作对话框', False, str(e))
+    finally:
+        if app:
+            app.processEvents()
+
+def test_gui_batch_end_to_end():
+    print('\n=== 测试 GUI 批量操作端到端 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    course_data = {
+        'title': 'GUI 端到端批量测试',
+        'theme': 'GUI 测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    students = [
+        {'name': '端到端学生1', 'employee_id': 'GUIE2E001', 'department': '技术部'},
+        {'name': '端到端学生2', 'employee_id': 'GUIE2E002', 'department': '产品部'},
+        {'name': '端到端学生3', 'employee_id': 'GUIE2E003', 'department': '运营部'},
+    ]
+
+    for s in students:
+        RegistrationService.register_student(course_id, s)
+
+    original_confirm_exec = BatchOperationConfirmDialog.exec
+    original_result_exec = BatchOperationResultDialog.exec
+
+    def mock_confirm_exec(self):
+        return QDialog.Accepted
+
+    def mock_result_exec(self):
+        return QDialog.Accepted
+
+    BatchOperationConfirmDialog.exec = mock_confirm_exec
+    BatchOperationResultDialog.exec = mock_result_exec
+
+    try:
+        widget = CourseDetailWidget(course_id)
+        widget.show()
+        app.processEvents()
+
+        table = widget.reg_table
+        assert table.rowCount() == 3
+
+        for row in range(table.rowCount()):
+            cell_widget = table.cellWidget(row, 0)
+            if cell_widget:
+                checkbox = cell_widget.findChild(QCheckBox)
+                if checkbox:
+                    checkbox.setChecked(True)
+        app.processEvents()
+
+        assert len(widget.selected_registrations) == 3
+        assert widget.selection_label.text() == '已选择 3 人'
+        print_test('GUI 复选框选择功能正常', True)
+
+        batch_result_ref = [None]
+        original_batch_cancel = BatchOperationService.batch_cancel
+        def mock_batch_cancel(course_id, reg_ids, operator='管理员'):
+            result = original_batch_cancel(course_id, reg_ids, operator)
+            batch_result_ref[0] = result
+            return result
+        BatchOperationService.batch_cancel = staticmethod(mock_batch_cancel)
+
+        batch_cancel_btn = None
+        for child in widget.findChildren(QPushButton):
+            if child.text() == '批量取消':
+                batch_cancel_btn = child
+                break
+
+        assert batch_cancel_btn is not None
+        batch_cancel_btn.click()
+        app.processEvents()
+
+        assert batch_result_ref[0] is not None
+        result = batch_result_ref[0]
+        assert result['total_count'] == 3
+        assert result['success_count'] == 3
+        print_test('GUI 按钮触发批量操作成功', True, f'成功{result["success_count"]}条')
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        cancelled_count = len([r for r in regs if r['status'] == 'cancelled'])
+        assert cancelled_count == 3
+        print_test('GUI 触发操作后数据更新', True)
+
+        assert UndoManager.has_undo_available()
+        print_test('操作后撤销可用', True)
+
+        widget.close()
+    finally:
+        BatchOperationConfirmDialog.exec = original_confirm_exec
+        BatchOperationResultDialog.exec = original_result_exec
+        BatchOperationService.batch_cancel = staticmethod(original_batch_cancel)
+        if app:
+            app.processEvents()
+
+def test_gui_export_trigger():
+    print('\n=== 测试 GUI 导出功能触发 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    result_data = {
+        'batch_log_id': 1,
+        'from_course_title': '导出源课程',
+        'to_course_title': '导出目标课程',
+        'total_count': 3,
+        'success_count': 2,
+        'failure_count': 1,
+        'items': [
+            {'employee_id': 'EXPGUI001', 'name': '导出学生1', 'department': '技术部', 'success': True, 'failure_reason': ''},
+            {'employee_id': 'EXPGUI002', 'name': '导出学生2', 'department': '产品部', 'success': False, 'failure_reason': '容量不足'},
+            {'employee_id': 'EXPGUI003', 'name': '导出学生3', 'department': '运营部', 'success': True, 'failure_reason': ''},
+        ]
+    }
+
+    export_path_ref = [None]
+    original_export = ExportService.export_batch_operation_result
+    def mock_export(result, output_path=None):
+        nonlocal export_path_ref
+        path = original_export(result, output_path)
+        export_path_ref[0] = path
+        return path
+    ExportService.export_batch_operation_result = staticmethod(mock_export)
+
+    original_get_save = QFileDialog.getSaveFileName
+    def mock_get_save(parent, title, default, filter_str):
+        test_path = os.path.join(os.path.dirname(__file__), 'test_gui_batch_export.csv')
+        return (test_path, filter_str)
+    QFileDialog.getSaveFileName = staticmethod(mock_get_save)
+
+    try:
+        dialog = BatchOperationResultDialog(result_data, 'transfer')
+        dialog.show()
+        app.processEvents()
+
+        export_btn = None
+        for child in dialog.findChildren(QPushButton):
+            if '导出' in child.text():
+                export_btn = child
+                break
+
+        assert export_btn is not None
+        assert export_btn.isVisible()
+        assert export_btn.isEnabled()
+        print_test('结果对话框有导出按钮', True)
+
+        export_btn.click()
+        app.processEvents()
+
+        assert export_path_ref[0] is not None
+        assert os.path.exists(export_path_ref[0])
+        print_test('GUI 导出功能正常触发', True, f'文件: {export_path_ref[0]}')
+
+        with open(export_path_ref[0], 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+            assert 'EXPGUI001' in content
+            assert 'EXPGUI002' in content
+            assert 'EXPGUI003' in content
+            assert '容量不足' in content
+            print_test('导出文件内容正确', True)
+
+        dialog.close()
+    finally:
+        ExportService.export_batch_operation_result = staticmethod(original_export)
+        QFileDialog.getSaveFileName = staticmethod(original_get_save)
+        if export_path_ref[0] and os.path.exists(export_path_ref[0]):
+            try:
+                os.remove(export_path_ref[0])
+            except:
+                pass
+        if app:
+            app.processEvents()
+
+def test_gui_persistence_after_restart():
+    print('\n=== 测试 GUI 批量操作持久化（重启验证） ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    course_data = {
+        'title': 'GUI 批量持久化测试',
+        'theme': 'GUI 测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    students = [
+        {'name': '持久学生A', 'employee_id': 'GUIPERBA001', 'department': '技术部'},
+        {'name': '持久学生B', 'employee_id': 'GUIPERBA002', 'department': '产品部'},
+    ]
+
+    for s in students:
+        RegistrationService.register_student(course_id, s)
+
+    BatchOperationService.batch_change_status(course_id,
+        [r['id'] for r in RegistrationService.get_course_registrations(course_id)],
+        'attended'
+    )
+
+    regs_before = RegistrationService.get_course_registrations(course_id)
+    status_before = {r['employee_id']: r['status'] for r in regs_before}
+
+    logs_before = BatchOperationLogDAO.get_latest(limit=1)
+    assert len(logs_before) == 1
+
+    print('--- 模拟程序关闭后重启 ---')
+    from db.database import init_database
+    init_database()
+
+    widget = CourseDetailWidget(course_id)
+    widget.show()
+    app.processEvents()
+
+    reg_table = widget.reg_table
+    visible_rows = reg_table.rowCount()
+    assert visible_rows == 2
+
+    status_in_gui = {}
+    for row in range(visible_rows):
+        emp_id = reg_table.item(row, 1).text()
+        status_in_gui[emp_id] = 'visible'
+
+    assert 'GUIPERBA001' in status_in_gui
+    assert 'GUIPERBA002' in status_in_gui
+    print_test('重启后 GUI 显示正确', True, f'{visible_rows}条记录')
+
+    regs_after = RegistrationService.get_course_registrations(course_id)
+    status_after = {r['employee_id']: r['status'] for r in regs_after}
+    assert status_before == status_after
+    print_test('重启后数据状态一致', True, f'状态: {status_after}')
+
+    logs_after = BatchOperationLogDAO.get_latest(limit=1)
+    assert len(logs_after) == 1
+    assert logs_after[0]['id'] == logs_before[0]['id']
+    print_test('重启后批量操作日志完整', True)
+
+    assert not UndoManager.has_undo_available()
+    print_test('重启后撤销不可用（会话边界）', True)
+
+    widget.close()
+
 def test_summary():
     print('\n' + '='*50)
     print('所有测试用例执行完成')
@@ -1266,11 +2277,47 @@ if __name__ == '__main__':
         test_gui_import_trigger_end_to_end()
         test_gui_import_persistence_after_restart()
 
+        print('\n' + '='*50)
+        print('批量操作专项测试')
+        print('='*50)
+
+        test_batch_operation_preview()
+        test_batch_cancel_partial_failure()
+        test_batch_change_status()
+        test_batch_transfer_rules()
+        test_batch_operation_export()
+        test_batch_operation_persistence()
+
+        print('\n' + '='*50)
+        print('撤销功能专项测试')
+        print('='*50)
+
+        test_undo_cancel_operation()
+        test_undo_transfer_operation()
+        test_undo_session_boundary()
+
+        print('\n' + '='*50)
+        print('批量操作 GUI 集成测试')
+        print('='*50)
+
+        test_gui_batch_operation_buttons()
+        test_gui_undo_button()
+        test_gui_batch_dialogs()
+        test_gui_batch_end_to_end()
+        test_gui_export_trigger()
+        test_gui_persistence_after_restart()
+
         test_summary()
     finally:
         db_module.DB_PATH = original_path
 
         export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '批量导入结果_*.csv'))
+        for f in export_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+        export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '批量操作结果_*.csv'))
         for f in export_files:
             try:
                 os.remove(f)

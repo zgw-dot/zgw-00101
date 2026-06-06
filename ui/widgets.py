@@ -3,19 +3,22 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QMessageBox, QLabel, QSplitter,
     QListWidget, QListWidgetItem, QComboBox, QLineEdit, QCalendarWidget,
     QTextEdit, QFrame, QGroupBox, QAbstractItemView, QMenu, QToolBar,
-    QStatusBar, QTabWidget, QFileDialog
+    QStatusBar, QTabWidget, QFileDialog, QCheckBox
 )
 from PySide6.QtCore import Qt, QDate, QTimer
 from PySide6.QtGui import QAction, QColor, QBrush, QFont
 from datetime import datetime, timedelta
 from services import (
     CourseService, RegistrationService, AttendanceService,
-    ExportService, ExceptionService, ValidationError
+    ExportService, ExceptionService, BatchOperationService,
+    UndoManager, ValidationError
 )
 from .dialogs import (
     CourseDialog, RegistrationDialog, TransferDialog,
     TransferReviewDialog, CheckInDialog, MakeupRequestDialog,
-    MakeupReviewDialog, DateRangeDialog, BatchImportResultDialog
+    MakeupReviewDialog, DateRangeDialog, BatchImportResultDialog,
+    BatchOperationConfirmDialog, BatchOperationResultDialog,
+    BatchTargetCourseDialog, BatchTargetStatusDialog
 )
 
 class CourseCalendarWidget(QWidget):
@@ -273,6 +276,7 @@ class CourseDetailWidget(QWidget):
     def __init__(self, course_id, parent=None):
         super().__init__(parent)
         self.course_id = course_id
+        self.selected_registrations = set()
         self.init_ui()
         self.refresh()
 
@@ -315,15 +319,58 @@ class CourseDetailWidget(QWidget):
 
         layout.addLayout(toolbar)
 
+        batch_toolbar = QHBoxLayout()
+        batch_toolbar.setContentsMargins(0, 5, 0, 5)
+
+        self.select_all_checkbox = QCheckBox('全选')
+        self.select_all_checkbox.stateChanged.connect(self.on_select_all_changed)
+        batch_toolbar.addWidget(self.select_all_checkbox)
+
+        self.selection_label = QLabel('已选择 0 人')
+        self.selection_label.setStyleSheet('color: #1976d2; font-weight: bold;')
+        batch_toolbar.addWidget(self.selection_label)
+
+        batch_toolbar.addSpacing(20)
+
+        self.batch_cancel_btn = QPushButton('批量取消')
+        self.batch_cancel_btn.setStyleSheet(
+            'background: #f44336; color: white; padding: 6px 16px;'
+        )
+        self.batch_cancel_btn.clicked.connect(self.batch_cancel)
+        batch_toolbar.addWidget(self.batch_cancel_btn)
+
+        self.batch_change_status_btn = QPushButton('批量改状态')
+        self.batch_change_status_btn.setStyleSheet(
+            'background: #9c27b0; color: white; padding: 6px 16px;'
+        )
+        self.batch_change_status_btn.clicked.connect(self.batch_change_status)
+        batch_toolbar.addWidget(self.batch_change_status_btn)
+
+        self.batch_transfer_btn = QPushButton('批量调课')
+        self.batch_transfer_btn.setStyleSheet(
+            'background: #2196f3; color: white; padding: 6px 16px;'
+        )
+        self.batch_transfer_btn.clicked.connect(self.batch_transfer)
+        batch_toolbar.addWidget(self.batch_transfer_btn)
+
+        batch_toolbar.addStretch()
+
+        layout.addLayout(batch_toolbar)
+
         self.tabs = QTabWidget()
 
         self.reg_tab = QWidget()
         reg_layout = QVBoxLayout(self.reg_tab)
         self.reg_table = QTableWidget()
-        self.reg_table.setColumnCount(6)
-        self.reg_table.setHorizontalHeaderLabels(['工号', '姓名', '部门', '电话', '邮箱', '操作'])
-        self.reg_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.reg_table.setColumnCount(7)
+        self.reg_table.setHorizontalHeaderLabels(
+            ['选择', '工号', '姓名', '部门', '电话', '邮箱', '操作']
+        )
+        self.reg_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for i in range(1, 6):
+            self.reg_table.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
         self.reg_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.reg_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         reg_layout.addWidget(self.reg_table)
 
         self.att_tab = QWidget()
@@ -367,12 +414,31 @@ class CourseDetailWidget(QWidget):
         regs = RegistrationService.get_course_registrations(self.course_id)
         self.reg_table.setRowCount(len(regs))
 
+        preserved_selection = set()
+        for reg_id in self.selected_registrations:
+            preserved_selection.add(reg_id)
+
+        self.selected_registrations.clear()
+
         for row, reg in enumerate(regs):
-            self.reg_table.setItem(row, 0, QTableWidgetItem(reg['employee_id']))
-            self.reg_table.setItem(row, 1, QTableWidgetItem(reg['name']))
-            self.reg_table.setItem(row, 2, QTableWidgetItem(reg.get('department', '')))
-            self.reg_table.setItem(row, 3, QTableWidgetItem(reg.get('phone', '')))
-            self.reg_table.setItem(row, 4, QTableWidgetItem(reg.get('email', '')))
+            checkbox_widget = QWidget()
+            checkbox_layout = QHBoxLayout(checkbox_widget)
+            checkbox_layout.setContentsMargins(0, 0, 0, 0)
+            checkbox_layout.setAlignment(Qt.AlignCenter)
+            checkbox = QCheckBox()
+            checkbox.stateChanged.connect(
+                lambda state, rid=reg['id']: self.on_checkbox_changed(rid, state)
+            )
+            if reg['id'] in preserved_selection:
+                checkbox.setChecked(True)
+            checkbox_layout.addWidget(checkbox)
+            self.reg_table.setCellWidget(row, 0, checkbox_widget)
+
+            self.reg_table.setItem(row, 1, QTableWidgetItem(reg['employee_id']))
+            self.reg_table.setItem(row, 2, QTableWidgetItem(reg['name']))
+            self.reg_table.setItem(row, 3, QTableWidgetItem(reg.get('department', '')))
+            self.reg_table.setItem(row, 4, QTableWidgetItem(reg.get('phone', '')))
+            self.reg_table.setItem(row, 5, QTableWidgetItem(reg.get('email', '')))
 
             btn_widget = QWidget()
             btn_layout = QHBoxLayout(btn_widget)
@@ -381,9 +447,62 @@ class CourseDetailWidget(QWidget):
             transfer_btn.setFixedHeight(24)
             transfer_btn.clicked.connect(lambda _, r=reg: self.request_transfer(r))
             btn_layout.addWidget(transfer_btn)
-            self.reg_table.setCellWidget(row, 5, btn_widget)
+            self.reg_table.setCellWidget(row, 6, btn_widget)
 
-            self.reg_table.item(row, 0).setData(Qt.UserRole, reg['id'])
+            self.reg_table.item(row, 1).setData(Qt.UserRole, reg['id'])
+
+        self.update_selection_label()
+        self.update_select_all_state()
+
+    def on_checkbox_changed(self, reg_id, state):
+        if state == Qt.Checked:
+            self.selected_registrations.add(reg_id)
+        else:
+            self.selected_registrations.discard(reg_id)
+        self.update_selection_label()
+        self.update_select_all_state()
+
+    def on_select_all_changed(self, state):
+        for row in range(self.reg_table.rowCount()):
+            cell_widget = self.reg_table.cellWidget(row, 0)
+            if cell_widget:
+                checkbox = cell_widget.findChild(QCheckBox)
+                if checkbox:
+                    checkbox.blockSignals(True)
+                    checkbox.setChecked(state == Qt.Checked)
+                    checkbox.blockSignals(False)
+
+                    reg_id = self.reg_table.item(row, 1).data(Qt.UserRole)
+                    if state == Qt.Checked:
+                        self.selected_registrations.add(reg_id)
+                    else:
+                        self.selected_registrations.discard(reg_id)
+
+        self.update_selection_label()
+
+    def update_selection_label(self):
+        count = len(self.selected_registrations)
+        self.selection_label.setText(f'已选择 {count} 人')
+
+    def update_select_all_state(self):
+        total = self.reg_table.rowCount()
+        if total == 0:
+            self.select_all_checkbox.setCheckState(Qt.Unchecked)
+            return
+
+        selected = len(self.selected_registrations)
+        if selected == 0:
+            self.select_all_checkbox.blockSignals(True)
+            self.select_all_checkbox.setCheckState(Qt.Unchecked)
+            self.select_all_checkbox.blockSignals(False)
+        elif selected == total:
+            self.select_all_checkbox.blockSignals(True)
+            self.select_all_checkbox.setCheckState(Qt.Checked)
+            self.select_all_checkbox.blockSignals(False)
+        else:
+            self.select_all_checkbox.blockSignals(True)
+            self.select_all_checkbox.setCheckState(Qt.PartiallyChecked)
+            self.select_all_checkbox.blockSignals(False)
 
     def refresh_attendance(self):
         attendances = AttendanceService.get_course_attendance(self.course_id)
@@ -501,6 +620,137 @@ class CourseDetailWidget(QWidget):
         if dialog.exec():
             self.refresh()
             self.window().refresh_all()
+
+    def batch_cancel(self):
+        if not self.selected_registrations:
+            QMessageBox.information(self, '提示', '请先选择要操作的学员')
+            return
+
+        course = CourseService.get_course(self.course_id)
+        if not course or course['status'] != 'published':
+            QMessageBox.warning(self, '提示', '只能对已发布课程执行批量操作')
+            return
+
+        reg_ids = list(self.selected_registrations)
+        try:
+            preview = BatchOperationService.get_preview(
+                self.course_id, reg_ids, 'cancel'
+            )
+
+            confirm_dialog = BatchOperationConfirmDialog(preview, 'cancel', self)
+            if confirm_dialog.exec():
+                result = BatchOperationService.batch_cancel(
+                    self.course_id, reg_ids
+                )
+                self._show_batch_result(result, 'cancel')
+        except Exception as e:
+            QMessageBox.warning(self, '操作失败', f'批量取消失败：{e}')
+
+    def batch_change_status(self):
+        if not self.selected_registrations:
+            QMessageBox.information(self, '提示', '请先选择要操作的学员')
+            return
+
+        course = CourseService.get_course(self.course_id)
+        if not course or course['status'] != 'published':
+            QMessageBox.warning(self, '提示', '只能对已发布课程执行批量操作')
+            return
+
+        target_dialog = BatchTargetStatusDialog(self)
+        if target_dialog.exec():
+            target_status = target_dialog.get_target_status()
+            if not target_status:
+                return
+
+            reg_ids = list(self.selected_registrations)
+            try:
+                preview = BatchOperationService.get_preview(
+                    self.course_id, reg_ids, 'change_status', target_status=target_status
+                )
+
+                confirm_dialog = BatchOperationConfirmDialog(
+                    preview, 'change_status', self, target_status=target_status
+                )
+                if confirm_dialog.exec():
+                    result = BatchOperationService.batch_change_status(
+                        self.course_id, reg_ids, target_status
+                    )
+                    self._show_batch_result(result, 'change_status')
+            except Exception as e:
+                QMessageBox.warning(self, '操作失败', f'批量改状态失败：{e}')
+
+    def batch_transfer(self):
+        if not self.selected_registrations:
+            QMessageBox.information(self, '提示', '请先选择要操作的学员')
+            return
+
+        course = CourseService.get_course(self.course_id)
+        if not course or course['status'] != 'published':
+            QMessageBox.warning(self, '提示', '只能对已发布课程执行批量操作')
+            return
+
+        target_dialog = BatchTargetCourseDialog(self.course_id, self)
+        if target_dialog.exec():
+            target_course_id = target_dialog.get_target_course_id()
+            if not target_course_id:
+                return
+
+            reg_ids = list(self.selected_registrations)
+            try:
+                preview = BatchOperationService.get_preview(
+                    self.course_id, reg_ids, 'transfer', target_course_id=target_course_id
+                )
+
+                confirm_dialog = BatchOperationConfirmDialog(
+                    preview, 'transfer', self, target_course_id=target_course_id
+                )
+                if confirm_dialog.exec():
+                    result = BatchOperationService.batch_transfer(
+                        self.course_id, reg_ids, target_course_id
+                    )
+                    self._show_batch_result(result, 'transfer')
+            except Exception as e:
+                QMessageBox.warning(self, '操作失败', f'批量调课失败：{e}')
+
+    def _show_batch_result(self, result, operation_type):
+        self.refresh()
+        self.window().refresh_all()
+        self.selected_registrations.clear()
+
+        result_dialog = BatchOperationResultDialog(result, operation_type, self)
+        result_dialog.undo_requested.connect(self._handle_undo)
+        result_dialog.export_requested.connect(lambda r, ot: self._handle_export(r, ot))
+        result_dialog.exec()
+
+    def _handle_undo(self):
+        try:
+            result = UndoManager.undo_last_operation()
+            if result:
+                QMessageBox.information(self, '撤销成功',
+                    f'已撤销 {result["restored_count"]} 条记录')
+                self.refresh()
+                self.window().refresh_all()
+            else:
+                QMessageBox.warning(self, '撤销失败', '没有可撤销的操作')
+        except Exception as e:
+            QMessageBox.warning(self, '撤销失败', f'撤销操作失败：{e}')
+
+    def _handle_export(self, batch_result, operation_type):
+        try:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                '导出批量操作结果',
+                f'批量操作结果_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
+                'CSV 文件 (*.csv)'
+            )
+            if file_path:
+                ExportService.export_batch_operation_result(
+                    batch_result, file_path
+                )
+                QMessageBox.information(self, '导出成功',
+                    f'批量操作结果已导出到：{file_path}')
+        except Exception as e:
+            QMessageBox.warning(self, '导出失败', f'导出失败：{e}')
 
 class TransferReviewWidget(QWidget):
     def __init__(self, parent=None):

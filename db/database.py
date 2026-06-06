@@ -111,5 +111,44 @@ def init_database():
     )
     ''')
 
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS batch_operation_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_type TEXT NOT NULL,
+        from_course_id INTEGER,
+        to_course_id INTEGER,
+        target_status TEXT,
+        total_count INTEGER NOT NULL,
+        success_count INTEGER NOT NULL,
+        failure_count INTEGER NOT NULL,
+        operated_by TEXT DEFAULT '管理员',
+        created_at TEXT NOT NULL,
+        undone INTEGER NOT NULL DEFAULT 0,
+        undone_at TEXT,
+        FOREIGN KEY (from_course_id) REFERENCES courses(id) ON DELETE SET NULL,
+        FOREIGN KEY (to_course_id) REFERENCES courses(id) ON DELETE SET NULL
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS batch_operation_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_log_id INTEGER NOT NULL,
+        registration_id INTEGER,
+        student_id INTEGER NOT NULL,
+        from_course_id INTEGER,
+        to_course_id INTEGER,
+        old_status TEXT NOT NULL,
+        new_status TEXT NOT NULL,
+        success INTEGER NOT NULL,
+        failure_reason TEXT,
+        undo_data TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (batch_log_id) REFERENCES batch_operation_logs(id) ON DELETE CASCADE,
+        FOREIGN KEY (registration_id) REFERENCES registrations(id) ON DELETE SET NULL,
+        FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
+    )
+    ''')
+
     conn.commit()
     conn.close()

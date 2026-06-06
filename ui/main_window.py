@@ -1,17 +1,18 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QStackedWidget, QListWidget, QListWidgetItem, QStatusBar,
-    QMessageBox
+    QMessageBox, QToolBar, QSizePolicy
 )
 from PySide6.QtCore import Qt, QTimer, QSize
-from PySide6.QtGui import QIcon, QColor, QBrush
+from PySide6.QtGui import QIcon, QColor, QBrush, QAction
 from db import init_database
-from services import ExceptionService
+from services import ExceptionService, UndoManager
 from .widgets import (
     CourseCalendarWidget, CourseListWidget, CourseDetailWidget,
     TransferReviewWidget, MakeupReviewWidget, ExceptionLogWidget,
     HistoryWidget
 )
+from .dialogs import UndoDialog
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -32,9 +33,47 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
+        main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
+
+        self.toolbar = QToolBar('工具栏')
+        self.toolbar.setMovable(False)
+        self.toolbar.setIconSize(QSize(20, 20))
+        self.toolbar.setStyleSheet('''
+            QToolBar {
+                background: #f8f9fa;
+                border-bottom: 1px solid #dee2e6;
+                padding: 4px;
+            }
+            QToolBar button {
+                padding: 6px 14px;
+                border-radius: 4px;
+                margin: 0 4px;
+            }
+        ''')
+        self.addToolBar(self.toolbar)
+
+        self.undo_action = QAction('↩ 撤销上次批量操作', self)
+        self.undo_action.setShortcut('Ctrl+Z')
+        self.undo_action.triggered.connect(self.show_undo_dialog)
+        self.toolbar.addAction(self.undo_action)
+
+        self.toolbar.addSeparator()
+
+        self.undo_status_label = QLabel('')
+        self.undo_status_label.setStyleSheet('color: #6c757d; font-size: 12px; padding: 0 10px;')
+        self.toolbar.addWidget(self.undo_status_label)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.toolbar.addWidget(spacer)
+
+        content_container = QWidget()
+        content_layout = QHBoxLayout(content_container)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        main_layout.addWidget(content_container, 1)
 
         self.sidebar = QListWidget()
         self.sidebar.setFixedWidth(200)
@@ -74,7 +113,7 @@ class MainWindow(QMainWindow):
 
         self.sidebar.setCurrentRow(0)
         self.sidebar.currentRowChanged.connect(self.on_menu_changed)
-        main_layout.addWidget(self.sidebar)
+        content_layout.addWidget(self.sidebar)
 
         self.content_stack = QStackedWidget()
 
@@ -92,12 +131,14 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(self.exception_widget)
         self.content_stack.addWidget(self.history_widget)
 
-        main_layout.addWidget(self.content_stack, 1)
+        content_layout.addWidget(self.content_stack, 1)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_label = QLabel()
         self.status_bar.addWidget(self.status_label)
+
+        self.update_undo_button_state()
 
     def init_menu(self):
         menubar = self.menuBar()
@@ -133,33 +174,6 @@ class MainWindow(QMainWindow):
             current.refresh()
         elif hasattr(current, 'refresh_calendar'):
             current.refresh_calendar()
-
-    def refresh_all(self):
-        try:
-            self.calendar_widget.refresh_calendar()
-        except:
-            pass
-        try:
-            self.course_list_widget.refresh()
-        except:
-            pass
-        try:
-            self.transfer_widget.refresh()
-        except:
-            pass
-        try:
-            self.makeup_widget.refresh()
-        except:
-            pass
-        try:
-            self.exception_widget.refresh()
-        except:
-            pass
-        try:
-            self.history_widget.refresh()
-        except:
-            pass
-        self.update_status_bar()
 
     def update_status_bar(self):
         try:
@@ -213,6 +227,75 @@ class MainWindow(QMainWindow):
             '<li>CSV 数据导出</li>'
             '</ul>'
         )
+
+    def show_undo_dialog(self):
+        dialog = UndoDialog(self)
+        if dialog.exec():
+            try:
+                result = UndoManager.undo_last_operation()
+                if result:
+                    QMessageBox.information(self, '撤销成功',
+                        f'已撤销 {result["restored_count"]} 条记录')
+                    self.refresh_all()
+                    self.update_undo_button_state()
+                else:
+                    QMessageBox.warning(self, '撤销失败', '没有可撤销的操作')
+            except Exception as e:
+                QMessageBox.warning(self, '撤销失败', f'撤销操作失败：{e}')
+
+    def update_undo_button_state(self):
+        try:
+            has_undo = UndoManager.has_undo_available()
+            self.undo_action.setEnabled(has_undo)
+
+            if has_undo:
+                undo_info = UndoManager.get_last_undo_info()
+                if undo_info:
+                    op_type_map = {
+                        'cancel': '批量取消',
+                        'change_status': '批量改状态',
+                        'transfer': '批量调课'
+                    }
+                    op_type = op_type_map.get(undo_info.get('operation_type'), '批量操作')
+                    self.undo_status_label.setText(
+                        f"可撤销: {op_type} ({undo_info.get('success_count', 0)} 条成功记录)"
+                    )
+                    self.undo_status_label.setStyleSheet('color: #ff9800; font-size: 12px; padding: 0 10px;')
+                else:
+                    self.undo_status_label.setText('')
+            else:
+                self.undo_status_label.setText('')
+                self.undo_status_label.setStyleSheet('color: #6c757d; font-size: 12px; padding: 0 10px;')
+        except Exception as e:
+            self.undo_status_label.setText('')
+
+    def refresh_all(self):
+        try:
+            self.calendar_widget.refresh_calendar()
+        except:
+            pass
+        try:
+            self.course_list_widget.refresh()
+        except:
+            pass
+        try:
+            self.transfer_widget.refresh()
+        except:
+            pass
+        try:
+            self.makeup_widget.refresh()
+        except:
+            pass
+        try:
+            self.exception_widget.refresh()
+        except:
+            pass
+        try:
+            self.history_widget.refresh()
+        except:
+            pass
+        self.update_status_bar()
+        self.update_undo_button_state()
 
     def closeEvent(self, event):
         reply = QMessageBox.question(

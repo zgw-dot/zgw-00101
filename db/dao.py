@@ -536,3 +536,238 @@ class ExceptionLogDAO:
         conn.commit()
         conn.close()
         return cursor.rowcount > 0
+
+import json
+
+class BatchOperationLogDAO:
+    @staticmethod
+    def create(operation_type, from_course_id=None, to_course_id=None,
+               target_status=None, total_count=0, success_count=0,
+               failure_count=0, operated_by='管理员'):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT INTO batch_operation_logs (
+            operation_type, from_course_id, to_course_id, target_status,
+            total_count, success_count, failure_count, operated_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (operation_type, from_course_id, to_course_id, target_status,
+              total_count, success_count, failure_count, operated_by, now))
+        conn.commit()
+        log_id = cursor.lastrowid
+        conn.close()
+        return log_id
+
+    @staticmethod
+    def update_counts(log_id, success_count, failure_count):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        UPDATE batch_operation_logs
+        SET success_count=?, failure_count=?
+        WHERE id=?
+        ''', (success_count, failure_count, log_id))
+        conn.commit()
+        conn.close()
+        return cursor.rowcount > 0
+
+    @staticmethod
+    def get_by_id(log_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM batch_operation_logs WHERE id=?', (log_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row_to_dict(row)
+
+    @staticmethod
+    def get_latest(limit=1):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT * FROM batch_operation_logs
+        WHERE undone=0 AND success_count > 0
+        ORDER BY created_at DESC
+        LIMIT ?
+        ''', (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+    @staticmethod
+    def mark_undone(log_id):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        UPDATE batch_operation_logs
+        SET undone=1, undone_at=?
+        WHERE id=?
+        ''', (now, log_id))
+        conn.commit()
+        conn.close()
+        return cursor.rowcount > 0
+
+class BatchOperationItemDAO:
+    @staticmethod
+    def create(batch_log_id, registration_id, student_id, from_course_id,
+               to_course_id, old_status, new_status, success,
+               failure_reason=None, undo_data=None):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        undo_json = json.dumps(undo_data) if undo_data else None
+        cursor.execute('''
+        INSERT INTO batch_operation_items (
+            batch_log_id, registration_id, student_id, from_course_id,
+            to_course_id, old_status, new_status, success,
+            failure_reason, undo_data, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (batch_log_id, registration_id, student_id, from_course_id,
+              to_course_id, old_status, new_status, 1 if success else 0,
+              failure_reason, undo_json, now))
+        conn.commit()
+        item_id = cursor.lastrowid
+        conn.close()
+        return item_id
+
+    @staticmethod
+    def get_by_batch_log(batch_log_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT bi.*, s.name as student_name, s.employee_id,
+               c1.title as from_course_title, c2.title as to_course_title
+        FROM batch_operation_items bi
+        JOIN students s ON bi.student_id = s.id
+        LEFT JOIN courses c1 ON bi.from_course_id = c1.id
+        LEFT JOIN courses c2 ON bi.to_course_id = c2.id
+        WHERE bi.batch_log_id=?
+        ORDER BY bi.id
+        ''', (batch_log_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        items = rows_to_dict_list(rows)
+        for item in items:
+            if item.get('undo_data'):
+                try:
+                    item['undo_data'] = json.loads(item['undo_data'])
+                except:
+                    pass
+        return items
+
+    @staticmethod
+    def get_successful_by_batch_log(batch_log_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT bi.*, s.name as student_name, s.employee_id,
+               c1.title as from_course_title, c2.title as to_course_title
+        FROM batch_operation_items bi
+        JOIN students s ON bi.student_id = s.id
+        LEFT JOIN courses c1 ON bi.from_course_id = c1.id
+        LEFT JOIN courses c2 ON bi.to_course_id = c2.id
+        WHERE bi.batch_log_id=? AND bi.success=1
+        ORDER BY bi.id
+        ''', (batch_log_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        items = rows_to_dict_list(rows)
+        for item in items:
+            if item.get('undo_data'):
+                try:
+                    item['undo_data'] = json.loads(item['undo_data'])
+                except:
+                    pass
+        return items
+
+class RegistrationDAOExt:
+    @staticmethod
+    def get_registrations_by_ids(registration_ids):
+        if not registration_ids:
+            return []
+        conn = get_connection()
+        cursor = conn.cursor()
+        placeholders = ','.join(['?'] * len(registration_ids))
+        cursor.execute(f'''
+        SELECT r.*, c.title as course_title, c.theme as course_theme,
+               c.start_time as course_start, c.end_time as course_end,
+               s.name as student_name, s.employee_id, s.department, s.phone, s.email
+        FROM registrations r
+        JOIN courses c ON r.course_id = c.id
+        JOIN students s ON r.student_id = s.id
+        WHERE r.id IN ({placeholders})
+        ''', registration_ids)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+    @staticmethod
+    def batch_update_status(registration_ids, new_status):
+        if not registration_ids:
+            return 0
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        placeholders = ','.join(['?'] * len(registration_ids))
+        cursor.execute(f'''
+        UPDATE registrations SET status=? WHERE id IN ({placeholders})
+        ''', [new_status] + registration_ids)
+        conn.commit()
+        count = cursor.rowcount
+        conn.close()
+        return count
+
+    @staticmethod
+    def batch_transfer(transfer_items):
+        if not transfer_items:
+            return []
+        conn = get_connection()
+        cursor = conn.cursor()
+        results = []
+        try:
+            for item in transfer_items:
+                reg_id = item['registration_id']
+                to_course_id = item['to_course_id']
+                student_id = item['student_id']
+
+                cursor.execute('UPDATE registrations SET status=? WHERE id=?',
+                              ('transferred_out', reg_id))
+
+                now = datetime.now().isoformat()
+                cursor.execute('''
+                INSERT INTO registrations (course_id, student_id, status, registered_at)
+                VALUES (?, ?, 'registered', ?)
+                ''', (to_course_id, student_id, now))
+                new_reg_id = cursor.lastrowid
+                results.append({
+                    'registration_id': reg_id,
+                    'new_registration_id': new_reg_id,
+                    'student_id': student_id,
+                    'from_course_id': item['from_course_id'],
+                    'to_course_id': to_course_id,
+                    'success': True
+                })
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+        return results
+
+    @staticmethod
+    def get_by_course_all_status(course_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT r.*, s.name, s.employee_id, s.department, s.phone, s.email
+        FROM registrations r
+        JOIN students s ON r.student_id = s.id
+        WHERE r.course_id=?
+        ORDER BY s.name
+        ''', (course_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)

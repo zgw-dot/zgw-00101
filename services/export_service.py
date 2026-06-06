@@ -250,3 +250,106 @@ class ExportService:
                 ])
 
         return output_path
+
+    @staticmethod
+    def export_batch_operation_result(batch_result, output_path=None):
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'exports'
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            safe_title = batch_result.get('course_title', '').replace('/', '_').replace('\\', '_')
+            operation_type = batch_result.get('operation_cn', '批量操作')
+            output_path = os.path.join(
+                output_dir,
+                f'{operation_type}结果_{safe_title}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            )
+
+        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+
+            writer.writerow([f'{batch_result.get("operation_cn", "批量操作")}结果'])
+            writer.writerow(['操作类型', batch_result.get('operation_cn', '')])
+            writer.writerow(['操作时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            writer.writerow(['原课程', batch_result.get('course_title', '')])
+
+            if batch_result.get('target_course_title'):
+                writer.writerow(['目标课程', batch_result.get('target_course_title', '')])
+
+            if batch_result.get('target_status_cn'):
+                writer.writerow(['目标状态', batch_result.get('target_status_cn', '')])
+
+            writer.writerow(['处理总数', batch_result.get('total', 0)])
+            writer.writerow(['成功数', batch_result.get('success_count', 0)])
+            writer.writerow(['失败数', batch_result.get('failure_count', 0)])
+            writer.writerow([])
+
+            operation_type = batch_result.get('operation_type', '')
+
+            if operation_type == 'transfer':
+                writer.writerow([
+                    '序号', '姓名', '工号', '部门',
+                    '原课程', '目标课程',
+                    '原状态', '新状态',
+                    '处理结果', '失败原因',
+                    '原报名ID', '新报名ID'
+                ])
+
+                for idx, row in enumerate(batch_result.get('rows', []), start=1):
+                    writer.writerow([
+                        idx,
+                        row.get('name', ''),
+                        row.get('employee_id', ''),
+                        row.get('department', ''),
+                        row.get('from_course_title', ''),
+                        row.get('to_course_title', ''),
+                        row.get('old_status_cn', row.get('old_status', '')),
+                        '已转出/已报名(目标课)',
+                        '成功' if row.get('success') else '失败',
+                        row.get('failure_reason', ''),
+                        row.get('registration_id', ''),
+                        row.get('new_registration_id', '')
+                    ])
+            elif operation_type == 'cancel':
+                writer.writerow([
+                    '序号', '姓名', '工号', '部门',
+                    '原课程', '原状态', '新状态',
+                    '处理结果', '失败原因', '报名ID'
+                ])
+
+                for idx, row in enumerate(batch_result.get('rows', []), start=1):
+                    writer.writerow([
+                        idx,
+                        row.get('name', ''),
+                        row.get('employee_id', ''),
+                        row.get('department', ''),
+                        batch_result.get('course_title', ''),
+                        row.get('old_status_cn', row.get('old_status', '')),
+                        '已取消',
+                        '成功' if row.get('success') else '失败',
+                        row.get('failure_reason', ''),
+                        row.get('registration_id', '')
+                    ])
+            else:
+                writer.writerow([
+                    '序号', '姓名', '工号', '部门',
+                    '课程', '原状态', '目标状态',
+                    '处理结果', '失败原因', '报名ID'
+                ])
+
+                for idx, row in enumerate(batch_result.get('rows', []), start=1):
+                    writer.writerow([
+                        idx,
+                        row.get('name', ''),
+                        row.get('employee_id', ''),
+                        row.get('department', ''),
+                        batch_result.get('course_title', ''),
+                        row.get('old_status_cn', row.get('old_status', '')),
+                        row.get('new_status_cn', row.get('new_status', '')),
+                        '成功' if row.get('success') else '失败',
+                        row.get('failure_reason', ''),
+                        row.get('registration_id', '')
+                    ])
+
+        return output_path
