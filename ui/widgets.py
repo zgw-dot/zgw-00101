@@ -653,7 +653,9 @@ class ExceptionLogWidget(QWidget):
             'over_capacity': '超容量报名',
             'transfer_after_deadline': '截止后调课',
             'duplicate_checkin': '重复签到',
-            'unapproved_makeup': '未审核补签生效'
+            'unapproved_makeup': '未审核补签生效',
+            'makeup_approved': '补签审核通过',
+            'makeup_rejected': '补签审核驳回'
         }
 
         for row, log in enumerate(logs):

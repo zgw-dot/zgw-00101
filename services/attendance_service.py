@@ -165,6 +165,24 @@ class AttendanceService:
         if not success:
             raise ValidationError('审核失败')
 
+        from db.dao import StudentDAO, CourseDAO, ExceptionLogDAO
+        student = StudentDAO.get_by_id(attendance['student_id'])
+        course = CourseDAO.get_by_id(attendance['course_id'])
+        student_name = student['name'] if student else '未知'
+        employee_id = student['employee_id'] if student else '未知'
+        course_title = course['title'] if course else '未知'
+        result = '通过' if approved else '驳回'
+        log_type = 'makeup_approved' if approved else 'makeup_rejected'
+        description = (
+            f'补签审核{result}：学员 {student_name}({employee_id}) 在课程【{course_title}】的补签申请'
+            f'被{reviewer}{result}。审核意见：{note if note else "无"}'
+        )
+        ExceptionLogDAO.create(
+            log_type, description,
+            course_id=attendance['course_id'],
+            student_id=attendance['student_id']
+        )
+
         return True
 
     @staticmethod
