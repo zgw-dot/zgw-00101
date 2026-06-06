@@ -97,6 +97,7 @@ class AttendanceService:
         marked = 0
 
         for reg in registrations:
+            AttendanceDAO.get_or_create(course_id, reg['student_id'])
             if AttendanceDAO.mark_absent(course_id, reg['student_id']):
                 marked += 1
 

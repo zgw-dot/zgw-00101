@@ -443,7 +443,7 @@ class AttendanceDAO:
             else:
                 cursor.execute('''
                 UPDATE attendances
-                SET makeup_status='rejected', makeup_reviewed_at=?,
+                SET status='absent', makeup_status='rejected', makeup_reviewed_at=?,
                     makeup_reviewer=?, updated_at=?
                 WHERE id=?
                 ''', (now, reviewer, now, attendance_id))

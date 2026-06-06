@@ -232,6 +232,8 @@ def test_attendance(course_id):
 
     assert att_approved is not None, 'FAIL: 未找到补签通过学员的出勤记录'
     assert att_rejected is not None, 'FAIL: 未找到补签驳回学员的出勤记录'
+    assert att_approved['status'] == 'absent', 'FAIL: 补签通过学员缺勤状态未正确设置'
+    assert att_rejected['status'] == 'absent', 'FAIL: 补签驳回学员缺勤状态未正确设置'
 
     print_test('构造缺勤学员-通过', True)
     print_test('构造缺勤学员-驳回', True)
@@ -241,7 +243,8 @@ def test_attendance(course_id):
     print_test('提交补签申请', True, '共 2 条')
 
     pending = AttendanceService.get_pending_makeups()
-    print_test('查询待审核补签', len(pending) >= 2, f'共 {len(pending)} 条')
+    assert len(pending) >= 2, f'FAIL: 待审核补签数量不足，期望>=2，实际{len(pending)}'
+    print_test('查询待审核补签', True, f'共 {len(pending)} 条')
 
     AttendanceService.review_makeup(att_approved['attendance_id'], True, '张管理员', '情况属实，予以通过')
     print_test('补签审核通过', True, '审核人: 张管理员')
