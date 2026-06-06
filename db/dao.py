@@ -1004,25 +1004,29 @@ class CertificateDAO:
         cursor = conn.cursor()
         try:
             certificate_no = None
+            last_error = None
             for _ in range(5):
                 candidate = CertificateDAO.generate_certificate_no(course_id)
-                cursor.execute('SELECT id FROM certificates WHERE certificate_no=?', (candidate,))
-                if not cursor.fetchone():
+                try:
+                    issue_date = now[:10]
+                    cursor.execute('''
+                    INSERT INTO certificates (
+                        certificate_no, course_id, student_id, registration_id,
+                        status, issue_date, generated_at, remark, operated_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (candidate, course_id, student_id, registration_id,
+                          status, issue_date, now, remark, operated_by))
+                    conn.commit()
                     certificate_no = candidate
                     break
+                except sqlite3.IntegrityError as e:
+                    last_error = e
+                    conn.rollback()
+                    continue
 
             if not certificate_no:
-                raise Exception('无法生成唯一证书编号')
+                raise Exception(f'无法生成唯一证书编号，最后错误: {last_error}')
 
-            issue_date = now[:10]
-            cursor.execute('''
-            INSERT INTO certificates (
-                certificate_no, course_id, student_id, registration_id,
-                status, issue_date, generated_at, remark, operated_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (certificate_no, course_id, student_id, registration_id,
-                  status, issue_date, now, remark, operated_by))
-            conn.commit()
             cert_id = cursor.lastrowid
             cursor.execute('SELECT * FROM certificates WHERE id=?', (cert_id,))
             row = cursor.fetchone()

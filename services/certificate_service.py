@@ -1,7 +1,7 @@
 from datetime import datetime
 from db.dao import (
     CertificateDAO, CertificateBatchLogDAO, CertificateBatchItemDAO,
-    CourseDAO, RegistrationDAO, AttendanceDAO, StudentDAO, ExceptionLogDAO
+    CourseDAO, RegistrationDAO, RegistrationDAOExt, AttendanceDAO, StudentDAO, ExceptionLogDAO
 )
 from .course_service import ValidationError
 
@@ -145,7 +145,7 @@ class CertificateService:
 
         CertificateService._validate_course_ended(course)
 
-        registrations = RegistrationDAO.get_by_course_all_status(course_id)
+        registrations = RegistrationDAOExt.get_by_course_all_status(course_id)
         reg = next((r for r in registrations if r['student_id'] == student_id), None)
         if not reg:
             raise ValidationError('该学员未报名此课程')
@@ -195,14 +195,12 @@ class CertificateService:
 
         preview = CertificateService.preview_generation(course_id)
 
+        all_students = preview['eligible'] + preview['ineligible']
         if student_ids is None:
-            eligible_ids = [s['student_id'] for s in preview['eligible']]
+            process_students = all_students
+            total_count = len(all_students)
         else:
-            eligible_ids = [s['student_id'] for s in preview['eligible']
-                            if s['student_id'] in student_ids]
-
-        total_count = len(eligible_ids) + len(preview['ineligible'])
-        if student_ids is not None:
+            process_students = [s for s in all_students if s['student_id'] in student_ids]
             total_count = len(student_ids)
 
         batch_log_id = CertificateBatchLogDAO.create(
@@ -215,7 +213,8 @@ class CertificateService:
         success_count = 0
         failure_count = 0
 
-        for student_id in (eligible_ids if student_ids is None else student_ids):
+        process_ids = [s['student_id'] for s in process_students]
+        for student_id in (process_ids if student_ids is None else student_ids):
             try:
                 cert = CertificateService.issue_certificate(
                     course_id=course_id,
@@ -276,7 +275,7 @@ class CertificateService:
 
         CertificateService._validate_course_ended(course)
 
-        registrations = RegistrationDAO.get_by_course_all_status(course_id)
+        registrations = RegistrationDAOExt.get_by_course_all_status(course_id)
         reg = next((r for r in registrations if r['student_id'] == student_id), None)
         if not reg:
             raise ValidationError('该学员未报名此课程')
