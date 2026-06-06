@@ -1,5 +1,6 @@
 import sys
 import os
+import glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datetime import datetime, timedelta
@@ -454,6 +455,367 @@ def test_persistence():
     print_test('重启后审核日志恢复-驳回', True, f'日志ID: {makeup_rejected_log["id"]}')
     print_test('重启后审核人信息完整', True, '张管理员、李管理员信息均恢复')
 
+def create_test_csv(filepath, rows, headers=None):
+    import csv
+    if headers is None:
+        headers = ['姓名', '工号', '部门', '联系方式']
+    with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(row)
+
+def test_batch_import_normal():
+    print('\n=== 测试批量报名导入（正常场景） ===')
+
+    course_data = {
+        'title': '批量导入测试课程',
+        'theme': '批量导入',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_import_normal.csv')
+    create_test_csv(csv_path, [
+        ['批量学生1', 'BATCH001', '技术部', '13800000001'],
+        ['批量学生2', 'BATCH002', '产品部', '13800000002'],
+        ['批量学生3', 'BATCH003', '运营部', '13800000003'],
+    ])
+
+    try:
+        result = RegistrationService.batch_import_students(course_id, csv_path)
+        assert result['total'] == 3, f'期望3条记录，实际{result["total"]}'
+        assert result['success_count'] == 3, f'期望成功3条，实际{result["success_count"]}'
+        assert result['failure_count'] == 0, f'期望失败0条，实际{result["failure_count"]}'
+        print_test('批量导入全部成功', True, f'成功{result["success_count"]}/失败{result["failure_count"]}')
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        assert len(regs) == 3, f'期望3条报名记录，实际{len(regs)}'
+        employee_ids = {r['employee_id'] for r in regs}
+        assert 'BATCH001' in employee_ids
+        assert 'BATCH002' in employee_ids
+        assert 'BATCH003' in employee_ids
+        print_test('导入后报名记录完整', True)
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
+    return course_id
+
+def test_batch_import_partial_failure():
+    print('\n=== 测试批量报名导入（部分失败） ===')
+
+    course_data = {
+        'title': '批量导入部分失败测试',
+        'theme': '批量导入',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_import_partial.csv')
+    create_test_csv(csv_path, [
+        ['有效学生1', 'PARTIAL001', '技术部', '13800000001'],
+        ['', 'PARTIAL002', '产品部', '13800000002'],
+        ['有效学生2', '', '运营部', '13800000003'],
+        ['有效学生3', 'PARTIAL004', '市场部', '13800000004'],
+    ])
+
+    try:
+        result = RegistrationService.batch_import_students(course_id, csv_path)
+        assert result['total'] == 4, f'期望4条记录，实际{result["total"]}'
+        assert result['success_count'] == 2, f'期望成功2条，实际{result["success_count"]}'
+        assert result['failure_count'] == 2, f'期望失败2条，实际{result["failure_count"]}'
+        print_test('批量导入部分成功', True, f'成功{result["success_count"]}/失败{result["failure_count"]}')
+
+        failure_reasons = [r['failure_reason'] for r in result['rows'] if not r['success']]
+        assert all('缺少必填字段' in r for r in failure_reasons)
+        print_test('失败原因正确', True, f'原因: {failure_reasons}')
+
+        success_rows = [r for r in result['rows'] if r['success']]
+        assert success_rows[0]['row_number'] == 2
+        assert success_rows[1]['row_number'] == 5
+        print_test('行号记录正确', True)
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        assert len(regs) == 2, f'期望2条报名记录，实际{len(regs)}'
+        print_test('仅成功记录写入数据库', True)
+
+        logs = ExceptionService.get_all_logs()
+        import_errors = [l for l in logs if l['type'] == 'import_validation_error']
+        assert len(import_errors) >= 2, f'期望至少2条导入异常日志，实际{len(import_errors)}'
+        print_test('失败记录写入异常日志', True, f'共{len(import_errors)}条')
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
+def test_batch_import_duplicate():
+    print('\n=== 测试批量报名导入（重复导入） ===')
+
+    course_data = {
+        'title': '批量导入重复测试',
+        'theme': '批量导入',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_import_duplicate.csv')
+    create_test_csv(csv_path, [
+        ['重复学生1', 'DUP001', '技术部', '13800000001'],
+        ['重复学生2', 'DUP002', '产品部', '13800000002'],
+    ])
+
+    try:
+        result1 = RegistrationService.batch_import_students(course_id, csv_path)
+        assert result1['success_count'] == 2
+        print_test('首次导入成功', True)
+
+        result2 = RegistrationService.batch_import_students(course_id, csv_path)
+        assert result2['total'] == 2
+        assert result2['success_count'] == 0, f'期望成功0条，实际{result2["success_count"]}'
+        assert result2['failure_count'] == 2, f'期望失败2条，实际{result2["failure_count"]}'
+        print_test('重复导入全部拦截', True, f'成功{result2["success_count"]}/失败{result2["failure_count"]}')
+
+        failure_reasons = [r['failure_reason'] for r in result2['rows']]
+        assert all('该学员已报名此课程' in r for r in failure_reasons)
+        print_test('重复导入失败原因正确', True)
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        assert len(regs) == 2, f'重复导入后报名数不应增加，期望2条，实际{len(regs)}'
+        print_test('重复导入不产生新报名', True)
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
+def test_batch_import_capacity():
+    print('\n=== 测试批量报名导入（容量边界） ===')
+
+    course_data = {
+        'title': '批量导入容量测试',
+        'theme': '批量导入',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 3,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_import_capacity.csv')
+    create_test_csv(csv_path, [
+        ['容量学生1', 'CAP001', '技术部', '13800000001'],
+        ['容量学生2', 'CAP002', '产品部', '13800000002'],
+        ['容量学生3', 'CAP003', '运营部', '13800000003'],
+        ['容量学生4', 'CAP004', '市场部', '13800000004'],
+        ['容量学生5', 'CAP005', '财务部', '13800000005'],
+    ])
+
+    try:
+        result = RegistrationService.batch_import_students(course_id, csv_path)
+        assert result['total'] == 5, f'期望5条记录，实际{result["total"]}'
+        assert result['success_count'] == 3, f'期望成功3条（容量），实际{result["success_count"]}'
+        assert result['failure_count'] == 2, f'期望失败2条（超容），实际{result["failure_count"]}'
+        print_test('容量边界正确拦截', True, f'成功{result["success_count"]}/失败{result["failure_count"]}')
+
+        success_ids = [r['employee_id'] for r in result['rows'] if r['success']]
+        failure_ids = [r['employee_id'] for r in result['rows'] if not r['success']]
+        assert success_ids == ['CAP001', 'CAP002', 'CAP003']
+        assert failure_ids == ['CAP004', 'CAP005']
+        print_test('按顺序处理，前3条成功后2条超容', True)
+
+        failure_reasons = [r['failure_reason'] for r in result['rows'] if not r['success']]
+        assert all('容量已满' in r for r in failure_reasons)
+        print_test('超容失败原因正确', True)
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        assert len(regs) == 3, f'期望3条报名，实际{len(regs)}'
+        course = CourseService.get_course(course_id)
+        assert course['capacity'] == 3
+        print_test('容量被占满但未超限', True)
+
+        logs = ExceptionService.get_all_logs()
+        over_cap_logs = [l for l in logs if l['type'] == 'over_capacity']
+        assert len(over_cap_logs) >= 2, f'期望至少2条超容日志，实际{len(over_cap_logs)}'
+        print_test('超容异常日志已记录', True, f'共{len(over_cap_logs)}条')
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
+def test_batch_import_unpublished():
+    print('\n=== 测试批量报名导入（未发布课程） ===')
+
+    course_data = {
+        'title': '未发布课程导入测试',
+        'theme': '批量导入',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'draft'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_import_unpublished.csv')
+    create_test_csv(csv_path, [
+        ['测试学生', 'UNPUB001', '技术部', '13800000001'],
+    ])
+
+    try:
+        result = RegistrationService.batch_import_students(course_id, csv_path)
+        assert result['total'] == 1
+        assert result['success_count'] == 0
+        assert result['failure_count'] == 1
+        assert '课程未发布' in result['rows'][0]['failure_reason']
+        print_test('未发布课程导入被拦截', True, result['rows'][0]['failure_reason'])
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        assert len(regs) == 0, '未发布课程不应有报名记录'
+        print_test('未发布课程无报名写入', True)
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
+def test_batch_import_persistence(course_id_for_persistence):
+    print('\n=== 测试批量导入数据持久化（重启后查询） ===')
+
+    regs_before = RegistrationService.get_course_registrations(course_id_for_persistence)
+    count_before = len(regs_before)
+    assert count_before > 0, '重启前应有报名记录'
+    print_test('重启前报名记录存在', True, f'共{count_before}条')
+
+    logs_before = ExceptionService.get_all_logs()
+    import_logs_before = [l for l in logs_before if l['type'] in ('import_validation_error', 'import_system_error', 'over_capacity')]
+    import_log_count_before = len(import_logs_before)
+
+    course_before = CourseService.get_course(course_id_for_persistence)
+    capacity_before = course_before['capacity']
+    registered_count_before = len(regs_before)
+
+    print('--- 模拟程序关闭后重启 ---')
+    from db.database import init_database
+    init_database()
+
+    regs_after = RegistrationService.get_course_registrations(course_id_for_persistence)
+    count_after = len(regs_after)
+    assert count_after == count_before, f'重启后报名记录数不一致，期望{count_before}，实际{count_after}'
+    print_test('重启后报名记录完整', True, f'共{count_after}条')
+
+    employee_ids_before = {r['employee_id'] for r in regs_before}
+    employee_ids_after = {r['employee_id'] for r in regs_after}
+    assert employee_ids_before == employee_ids_after, '重启后学员信息不一致'
+    print_test('重启后学员信息一致', True, f'工号: {employee_ids_after}')
+
+    logs_after = ExceptionService.get_all_logs()
+    import_logs_after = [l for l in logs_after if l['type'] in ('import_validation_error', 'import_system_error', 'over_capacity')]
+    import_log_count_after = len(import_logs_after)
+    assert import_log_count_after == import_log_count_before, '重启后异常日志数不一致'
+    print_test('重启后异常日志完整', True, f'共{import_log_count_after}条')
+
+    course_after = CourseService.get_course(course_id_for_persistence)
+    capacity_after = course_after['capacity']
+    registered_count_after = RegistrationDAO.count_by_course(course_id_for_persistence)
+    assert capacity_after == capacity_before, '重启后课程容量不一致'
+    assert registered_count_after == registered_count_before, '重启后容量占用不一致'
+    print_test('重启后课程容量占用一致', True, f'{registered_count_after}/{capacity_after}')
+
+def test_batch_import_result_export(import_course_id):
+    print('\n=== 测试批量导入结果导出 ===')
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_import_export.csv')
+    create_test_csv(csv_path, [
+        ['导出学生1', 'EXPORT001', '技术部', '13800000001'],
+        ['', 'EXPORT002', '产品部', '13800000002'],
+        ['导出学生3', 'EXPORT003', '', '13800000003'],
+    ])
+
+    try:
+        result = RegistrationService.batch_import_students(import_course_id, csv_path)
+        export_path = ExportService.export_import_result(result)
+
+        assert os.path.exists(export_path), '导出文件不存在'
+        print_test('导入结果CSV生成', True, f'文件: {export_path}')
+
+        with open(export_path, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+
+        assert '批量导入结果' in content
+        assert '导出学生1' in content
+        assert 'EXPORT001' in content
+        assert 'EXPORT002' in content
+        assert 'EXPORT003' in content
+        assert '成功' in content
+        assert '失败' in content
+        assert '缺少必填字段' in content
+        print_test('导出CSV包含正确内容', True)
+
+        assert '原始行号' in content
+        assert '处理结果' in content
+        assert '失败原因' in content
+        print_test('导出CSV包含正确表头', True)
+
+        success_count = content.count(',成功,') + content.count('"成功"')
+        failure_count = content.count(',失败,') + content.count('"失败"')
+        assert success_count >= 2, f'成功记录数不足，期望至少2条'
+        assert failure_count >= 1, f'失败记录数不足，期望至少1条'
+        print_test('导出CSV包含成功/失败标记', True, f'成功{success_count}条，失败{failure_count}条')
+
+        return export_path
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
+def test_batch_import_english_headers():
+    print('\n=== 测试批量报名导入（英文列表头） ===')
+
+    course_data = {
+        'title': '英文表头导入测试',
+        'theme': '批量导入',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_import_english.csv')
+    create_test_csv(csv_path, [
+        ['English Student', 'ENG001', 'Tech Dept', '13800000001'],
+    ], headers=['name', 'employee_id', 'department', 'phone'])
+
+    try:
+        result = RegistrationService.batch_import_students(course_id, csv_path)
+        assert result['success_count'] == 1
+        assert result['rows'][0]['name'] == 'English Student'
+        assert result['rows'][0]['employee_id'] == 'ENG001'
+        print_test('英文表头导入成功', True)
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
 def test_summary():
     print('\n' + '='*50)
     print('所有测试用例执行完成')
@@ -472,6 +834,8 @@ if __name__ == '__main__':
     db_module.DB_PATH = os.path.join(os.path.dirname(__file__), 'test_training.db')
     init_database()
 
+    from db.dao import RegistrationDAO
+
     try:
         test_course_validation()
         course_id = test_course_crud()
@@ -482,9 +846,44 @@ if __name__ == '__main__':
             test_persistence()
         test_exception_logs()
         test_deadline_transfer()
+
+        print('\n' + '='*50)
+        print('批量导入专项测试')
+        print('='*50)
+
+        batch_course_id = test_batch_import_normal()
+        test_batch_import_partial_failure()
+        test_batch_import_duplicate()
+        test_batch_import_capacity()
+        test_batch_import_unpublished()
+        test_batch_import_english_headers()
+
+        export_course_data = {
+            'title': '导入结果导出测试课程',
+            'theme': '批量导入',
+            'instructor': '测试讲师',
+            'venue': '测试场地',
+            'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+            'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+            'capacity': 10,
+            'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+            'status': 'published'
+        }
+        export_course_id = CourseService.create_course(export_course_data)
+        test_batch_import_result_export(export_course_id)
+
+        test_batch_import_persistence(batch_course_id)
+
         test_summary()
     finally:
         db_module.DB_PATH = original_path
+
+        export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '批量导入结果_*.csv'))
+        for f in export_files:
+            try:
+                os.remove(f)
+            except:
+                pass
 
         if os.path.exists('test_training.db'):
             try:

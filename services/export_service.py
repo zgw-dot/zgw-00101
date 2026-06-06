@@ -99,7 +99,9 @@ class ExportService:
             'duplicate_checkin': '重复签到',
             'unapproved_makeup': '未审核补签生效',
             'makeup_approved': '补签审核通过',
-            'makeup_rejected': '补签审核驳回'
+            'makeup_rejected': '补签审核驳回',
+            'import_validation_error': '批量导入校验失败',
+            'import_system_error': '批量导入系统异常'
         }
 
         with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
@@ -202,5 +204,49 @@ class ExportService:
 
                 writer.writerow([])
                 writer.writerow([])
+
+        return output_path
+
+    @staticmethod
+    def export_import_result(import_result, output_path=None):
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'exports'
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            safe_title = import_result.get('course_title', '').replace('/', '_').replace('\\', '_')
+            output_path = os.path.join(
+                output_dir,
+                f'批量导入结果_{safe_title}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            )
+
+        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+
+            writer.writerow(['批量导入结果'])
+            writer.writerow(['课程名称', import_result.get('course_title', '')])
+            writer.writerow(['导入时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            writer.writerow(['总行数', import_result.get('total', 0)])
+            writer.writerow(['成功', import_result.get('success_count', 0)])
+            writer.writerow(['失败', import_result.get('failure_count', 0)])
+            writer.writerow([])
+
+            writer.writerow([
+                '原始行号', '姓名', '工号', '部门', '联系方式',
+                '处理结果', '失败原因', '报名ID'
+            ])
+
+            for row in import_result.get('rows', []):
+                writer.writerow([
+                    row.get('row_number', ''),
+                    row.get('name', ''),
+                    row.get('employee_id', ''),
+                    row.get('department', ''),
+                    row.get('phone', ''),
+                    '成功' if row.get('success') else '失败',
+                    row.get('failure_reason', ''),
+                    row.get('registration_id', '')
+                ])
 
         return output_path
