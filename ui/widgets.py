@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QMessageBox, QLabel, QSplitter,
     QListWidget, QListWidgetItem, QComboBox, QLineEdit, QCalendarWidget,
     QTextEdit, QFrame, QGroupBox, QAbstractItemView, QMenu, QToolBar,
-    QStatusBar, QTabWidget
+    QStatusBar, QTabWidget, QFileDialog
 )
 from PySide6.QtCore import Qt, QDate, QTimer
 from PySide6.QtGui import QAction, QColor, QBrush, QFont
@@ -15,7 +15,7 @@ from services import (
 from .dialogs import (
     CourseDialog, RegistrationDialog, TransferDialog,
     TransferReviewDialog, CheckInDialog, MakeupRequestDialog,
-    MakeupReviewDialog, DateRangeDialog
+    MakeupReviewDialog, DateRangeDialog, BatchImportResultDialog
 )
 
 class CourseCalendarWidget(QWidget):
@@ -290,6 +290,11 @@ class CourseDetailWidget(QWidget):
         register_btn.clicked.connect(self.show_registration)
         toolbar.addWidget(register_btn)
 
+        batch_import_btn = QPushButton('批量导入报名')
+        batch_import_btn.setStyleSheet('background: #ff9800; color: white;')
+        batch_import_btn.clicked.connect(self.batch_import)
+        toolbar.addWidget(batch_import_btn)
+
         checkin_btn = QPushButton('签到')
         checkin_btn.clicked.connect(self.show_checkin)
         toolbar.addWidget(checkin_btn)
@@ -452,6 +457,38 @@ class CourseDetailWidget(QWidget):
             QMessageBox.information(self, '成功', f'已导出到：\n{path}')
         except Exception as e:
             QMessageBox.warning(self, '导出失败', str(e))
+
+    def batch_import(self):
+        course = CourseService.get_course(self.course_id)
+        if not course:
+            QMessageBox.warning(self, '提示', '课程不存在')
+            return
+
+        if course['status'] != 'published':
+            QMessageBox.warning(self, '提示', '课程未发布，不能导入报名')
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            '选择 CSV 文件',
+            '',
+            'CSV 文件 (*.csv)'
+        )
+
+        if not file_path:
+            return
+
+        try:
+            result = RegistrationService.batch_import_students(self.course_id, file_path)
+            self.refresh()
+            self.window().refresh_all()
+
+            dialog = BatchImportResultDialog(result, self)
+            dialog.exec()
+        except ValidationError as e:
+            QMessageBox.warning(self, '导入失败', str(e))
+        except Exception as e:
+            QMessageBox.warning(self, '系统错误', f'导入过程中发生错误：{e}')
 
     def request_transfer(self, reg):
         dialog = TransferDialog(reg, self)
@@ -655,7 +692,9 @@ class ExceptionLogWidget(QWidget):
             'duplicate_checkin': '重复签到',
             'unapproved_makeup': '未审核补签生效',
             'makeup_approved': '补签审核通过',
-            'makeup_rejected': '补签审核驳回'
+            'makeup_rejected': '补签审核驳回',
+            'import_validation_error': '批量导入校验失败',
+            'import_system_error': '批量导入系统异常'
         }
 
         for row, log in enumerate(logs):

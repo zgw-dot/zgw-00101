@@ -3,9 +3,10 @@ from PySide6.QtWidgets import (
     QTextEdit, QComboBox, QDateTimeEdit, QSpinBox, QPushButton,
     QMessageBox, QDialogButtonBox, QListWidget, QListWidgetItem,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QInputDialog, QDateEdit
+    QInputDialog, QDateEdit, QFileDialog, QFrame
 )
 from PySide6.QtCore import Qt, QDateTime, QDate
+from PySide6.QtGui import QColor, QBrush
 from services import (
     CourseService, RegistrationService, AttendanceService,
     ExportService, ValidationError
@@ -493,3 +494,104 @@ class DateRangeDialog(QDialog):
             self.start_edit.date().toString('yyyy-MM-dd'),
             self.end_edit.date().toString('yyyy-MM-dd')
         )
+
+class BatchImportResultDialog(QDialog):
+    def __init__(self, import_result, parent=None):
+        super().__init__(parent)
+        self.import_result = import_result
+        self.setWindowTitle('批量导入结果')
+        self.resize(900, 600)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet('background: #f5f5f5; border-radius: 8px; padding: 15px;')
+        summary_layout = QVBoxLayout(summary_frame)
+
+        title = QLabel(f'课程：{self.import_result.get("course_title", "")}')
+        title.setStyleSheet('font-size: 16px; font-weight: bold;')
+        summary_layout.addWidget(title)
+
+        stats_layout = QHBoxLayout()
+        total_label = QLabel(f'总行数：<b>{self.import_result.get("total", 0)}</b>')
+        total_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(total_label)
+
+        success_count = self.import_result.get("success_count", 0)
+        success_label = QLabel(f'成功：<b><span style="color: #4caf50;">{success_count}</span></b>')
+        success_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(success_label)
+
+        failure_count = self.import_result.get("failure_count", 0)
+        failure_label = QLabel(f'失败：<b><span style="color: #f44336;">{failure_count}</span></b>')
+        failure_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(failure_label)
+
+        stats_layout.addStretch()
+        summary_layout.addLayout(stats_layout)
+        layout.addWidget(summary_frame)
+
+        detail_label = QLabel('处理明细：')
+        detail_label.setStyleSheet('font-size: 14px; font-weight: bold; margin-top: 10px;')
+        layout.addWidget(detail_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            '行号', '姓名', '工号', '部门', '联系方式', '处理结果', '失败原因'
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+        rows = self.import_result.get('rows', [])
+        self.table.setRowCount(len(rows))
+
+        for row_idx, row_data in enumerate(rows):
+            self.table.setItem(row_idx, 0, QTableWidgetItem(str(row_data.get('row_number', ''))))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(row_data.get('name', '')))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(row_data.get('employee_id', '')))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(row_data.get('department', '')))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(row_data.get('phone', '')))
+
+            if row_data.get('success'):
+                result_item = QTableWidgetItem('成功')
+                result_item.setForeground(QBrush(QColor(76, 175, 80)))
+                result_item.setBackground(QBrush(QColor(232, 245, 233)))
+            else:
+                result_item = QTableWidgetItem('失败')
+                result_item.setForeground(QBrush(QColor(244, 67, 54)))
+                result_item.setBackground(QBrush(QColor(255, 235, 238)))
+            self.table.setItem(row_idx, 5, result_item)
+
+            failure_reason = row_data.get('failure_reason', '')
+            reason_item = QTableWidgetItem(failure_reason)
+            if failure_reason:
+                reason_item.setForeground(QBrush(QColor(244, 67, 54)))
+            self.table.setItem(row_idx, 6, reason_item)
+
+        layout.addWidget(self.table, 1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        export_btn = QPushButton('导出结果')
+        export_btn.setStyleSheet('background: #2196f3; color: white; padding: 8px 20px;')
+        export_btn.clicked.connect(self.export_result)
+        btn_layout.addWidget(export_btn)
+
+        close_btn = QPushButton('关闭')
+        close_btn.setStyleSheet('padding: 8px 20px;')
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+
+    def export_result(self):
+        try:
+            path = ExportService.export_import_result(self.import_result)
+            QMessageBox.information(self, '导出成功', f'导入结果已导出到：\n{path}')
+        except Exception as e:
+            QMessageBox.warning(self, '导出失败', str(e))

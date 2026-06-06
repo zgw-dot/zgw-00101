@@ -1,6 +1,7 @@
 import sys
 import os
 import glob
+import csv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datetime import datetime, timedelta
@@ -9,6 +10,15 @@ from services import (
     CourseService, RegistrationService, AttendanceService,
     ExportService, ExceptionService, ValidationError
 )
+
+try:
+    from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget, QFileDialog, QDialog
+    from PySide6.QtCore import Qt
+    from ui.widgets import CourseDetailWidget
+    from ui.dialogs import BatchImportResultDialog
+    PYSIDE_AVAILABLE = True
+except ImportError:
+    PYSIDE_AVAILABLE = False
 
 def print_test(name, passed, detail=''):
     status = '[PASS]' if passed else '[FAIL]'
@@ -816,6 +826,378 @@ def test_batch_import_english_headers():
         if os.path.exists(csv_path):
             os.remove(csv_path)
 
+def test_gui_batch_import_button():
+    print('\n=== 测试 GUI 批量导入入口 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    course_data = {
+        'title': 'GUI 测试课程',
+        'theme': 'GUI 测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    try:
+        widget = CourseDetailWidget(course_id)
+        widget.show()
+        app.processEvents()
+
+        batch_btn = None
+        for child in widget.findChildren(QPushButton):
+            if child.text() == '批量导入报名':
+                batch_btn = child
+                break
+
+        assert batch_btn is not None, 'FAIL: 未找到「批量导入报名」按钮'
+        assert batch_btn.isVisible(), 'FAIL: 按钮不可见'
+        assert batch_btn.isEnabled(), 'FAIL: 按钮不可用'
+        print_test('课程详情页有批量导入按钮', True)
+
+        assert batch_btn.styleSheet() != '', 'FAIL: 按钮无样式'
+        print_test('按钮有醒目的橙色样式', True)
+
+        widget.close()
+    finally:
+        if app:
+            app.processEvents()
+
+def test_gui_import_result_dialog():
+    print('\n=== 测试 GUI 导入结果对话框 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    mock_result = {
+        'course_id': 1,
+        'course_title': 'GUI 结果测试课程',
+        'total': 5,
+        'success_count': 3,
+        'failure_count': 2,
+        'rows': [
+            {'row_number': 2, 'name': '成功学生1', 'employee_id': 'GUI001', 'department': '技术部', 'phone': '13800000001', 'success': True, 'registration_id': 1001, 'failure_reason': ''},
+            {'row_number': 3, 'name': '', 'employee_id': 'GUI002', 'department': '产品部', 'phone': '13800000002', 'success': False, 'failure_reason': '缺少必填字段：姓名或工号不能为空'},
+            {'row_number': 4, 'name': '成功学生2', 'employee_id': 'GUI003', 'department': '运营部', 'phone': '13800000003', 'success': True, 'registration_id': 1002, 'failure_reason': ''},
+            {'row_number': 5, 'name': '重复学生', 'employee_id': 'GUI001', 'department': '技术部', 'phone': '13800000001', 'success': False, 'failure_reason': '该学员已报名此课程'},
+            {'row_number': 6, 'name': '成功学生3', 'employee_id': 'GUI004', 'department': '市场部', 'phone': '13800000004', 'success': True, 'registration_id': 1003, 'failure_reason': ''},
+        ]
+    }
+
+    try:
+        dialog = BatchImportResultDialog(mock_result)
+        dialog.show()
+        app.processEvents()
+
+        table = dialog.findChild(QTableWidget)
+        assert table is not None, 'FAIL: 未找到结果表格'
+        assert table.rowCount() == 5, f'FAIL: 表格行数应为5，实际{table.rowCount()}'
+        assert table.columnCount() == 7, f'FAIL: 表格列数应为7，实际{table.columnCount()}'
+        print_test('导入结果对话框含明细表格', True, f'{table.rowCount()}行x{table.columnCount()}列')
+
+        headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+        expected_headers = ['行号', '姓名', '工号', '部门', '联系方式', '处理结果', '失败原因']
+        assert headers == expected_headers, f'FAIL: 表头不正确，期望{expected_headers}，实际{headers}'
+        print_test('表格表头正确', True)
+
+        success_count = 0
+        failure_count = 0
+        for row in range(table.rowCount()):
+            result_item = table.item(row, 5)
+            if result_item:
+                if '成功' in result_item.text():
+                    success_count += 1
+                    success_color = result_item.foreground().color()
+                    assert success_color.green() > success_color.red() and success_color.green() > success_color.blue(), 'FAIL: 成功行颜色不是绿色系'
+                elif '失败' in result_item.text():
+                    failure_count += 1
+                    fail_color = result_item.foreground().color()
+                    assert fail_color.red() > fail_color.green() and fail_color.red() > fail_color.blue(), 'FAIL: 失败行颜色不是红色系'
+
+        assert success_count == 3, f'FAIL: 成功标记数应为3，实际{success_count}'
+        assert failure_count == 2, f'FAIL: 失败标记数应为2，实际{failure_count}'
+        print_test('成功/失败行颜色区分正确', True, f'成功{success_count}，失败{failure_count}')
+
+        failure_row = table.item(1, 6)
+        assert failure_row is not None
+        assert '缺少必填字段' in failure_row.text()
+        print_test('失败原因显示正确', True, failure_row.text())
+
+        duplicate_row = table.item(3, 6)
+        assert duplicate_row is not None
+        assert '该学员已报名此课程' in duplicate_row.text()
+        print_test('重复报名失败原因显示正确', True)
+
+        dialog.close()
+    finally:
+        if app:
+            app.processEvents()
+
+def test_gui_import_result_export():
+    print('\n=== 测试 GUI 导入结果导出 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    mock_result = {
+        'course_id': 1,
+        'course_title': 'GUI 导出测试课程',
+        'total': 3,
+        'success_count': 2,
+        'failure_count': 1,
+        'rows': [
+            {'row_number': 2, 'name': '导出学生1', 'employee_id': 'EXPGUI001', 'department': '技术部', 'phone': '13800000001', 'success': True, 'registration_id': 2001, 'failure_reason': ''},
+            {'row_number': 3, 'name': '', 'employee_id': 'EXPGUI002', 'department': '产品部', 'phone': '13800000002', 'success': False, 'failure_reason': '缺少必填字段：姓名或工号不能为空'},
+            {'row_number': 4, 'name': '导出学生2', 'employee_id': 'EXPGUI003', 'department': '运营部', 'phone': '13800000003', 'success': True, 'registration_id': 2002, 'failure_reason': ''},
+        ]
+    }
+
+    try:
+        dialog = BatchImportResultDialog(mock_result)
+        dialog.show()
+        app.processEvents()
+
+        export_path = None
+        original_export = ExportService.export_import_result
+        def mock_export(result, output_path=None):
+            nonlocal export_path
+            export_path = original_export(result, output_path)
+            return export_path
+
+        ExportService.export_import_result = mock_export
+
+        try:
+            dialog.export_result()
+
+            assert export_path is not None, 'FAIL: 未调用导出方法'
+            assert os.path.exists(export_path), f'FAIL: 导出文件不存在: {export_path}'
+            print_test('导出功能可从对话框触发', True, f'文件: {export_path}')
+
+            with open(export_path, 'r', encoding='utf-8-sig') as f:
+                content = f.read()
+
+            assert '批量导入结果' in content
+            assert 'EXPGUI001' in content
+            assert 'EXPGUI002' in content
+            assert 'EXPGUI003' in content
+            assert '缺少必填字段' in content
+            assert '成功' in content
+            assert '失败' in content
+            print_test('导出CSV内容完整', True)
+
+            assert '原始行号' in content
+            assert '处理结果' in content
+            assert '失败原因' in content
+            print_test('导出CSV含正确表头', True)
+        finally:
+            ExportService.export_import_result = original_export
+            if export_path and os.path.exists(export_path):
+                try:
+                    os.remove(export_path)
+                except:
+                    pass
+
+        dialog.close()
+    finally:
+        if app:
+            app.processEvents()
+
+def test_gui_import_trigger_end_to_end():
+    print('\n=== 测试 GUI 端到端导入触发 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    course_data = {
+        'title': 'GUI 端到端测试课程',
+        'theme': 'GUI 测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_gui_import.csv')
+    create_test_csv(csv_path, [
+        ['GUI学生1', 'GUIE2E001', '技术部', '13800000001'],
+        ['', 'GUIE2E002', '产品部', '13800000002'],
+        ['GUI学生2', 'GUIE2E003', '运营部', '13800000003'],
+    ])
+
+    original_get_open = QFileDialog.getOpenFileName
+    def mock_get_open(parent, title, default_dir, filter_str):
+        return (csv_path, filter_str)
+    QFileDialog.getOpenFileName = staticmethod(mock_get_open)
+
+    import_result_ref = [None]
+    original_batch_import = RegistrationService.batch_import_students
+    def mock_batch_import(course_id, csv_path):
+        result = original_batch_import(course_id, csv_path)
+        import_result_ref[0] = result
+        return result
+
+    RegistrationService.batch_import_students = staticmethod(mock_batch_import)
+
+    original_dialog_exec = BatchImportResultDialog.exec
+    def mock_dialog_exec(self):
+        return QDialog.Accepted
+    BatchImportResultDialog.exec = mock_dialog_exec
+
+    try:
+        widget = CourseDetailWidget(course_id)
+        widget.show()
+        app.processEvents()
+
+        batch_btn = None
+        for child in widget.findChildren(QPushButton):
+            if child.text() == '批量导入报名':
+                batch_btn = child
+                break
+
+        assert batch_btn is not None, 'FAIL: 未找到批量导入按钮'
+        assert batch_btn.isVisible(), 'FAIL: 按钮不可见'
+        assert batch_btn.isEnabled(), 'FAIL: 按钮不可用'
+        print_test('课程详情页有可用的批量导入按钮', True)
+
+        batch_btn.click()
+        app.processEvents()
+
+        assert import_result_ref[0] is not None, 'FAIL: 导入服务未被调用'
+        print_test('点击按钮触发导入流程', True)
+
+        result = import_result_ref[0]
+        assert result['total'] == 3
+        assert result['success_count'] == 2
+        assert result['failure_count'] == 1
+        print_test('导入结果正确返回', True, f'成功{result["success_count"]}/失败{result["failure_count"]}')
+
+        failure_rows = [r for r in result['rows'] if not r['success']]
+        assert len(failure_rows) == 1
+        assert '缺少必填字段' in failure_rows[0]['failure_reason']
+        print_test('失败行明细可见（含原因）', True, failure_rows[0]['failure_reason'])
+
+        success_rows = [r for r in result['rows'] if r['success']]
+        assert len(success_rows) == 2
+        assert success_rows[0]['row_number'] == 2
+        assert success_rows[1]['row_number'] == 4
+        print_test('成功行记录正确行号', True, f'行号: {[r["row_number"] for r in success_rows]}')
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        assert len(regs) == 2, f'期望2条报名记录，实际{len(regs)}'
+        emp_ids = {r['employee_id'] for r in regs}
+        assert 'GUIE2E001' in emp_ids
+        assert 'GUIE2E003' in emp_ids
+        print_test('成功的报名已写入数据库', True)
+
+        course = CourseService.get_course(course_id)
+        current_count = len(regs)
+        assert current_count <= course['capacity'], 'FAIL: 容量占用超过限制'
+        print_test('课程容量占用正确', True, f'{current_count}/{course["capacity"]}')
+
+        widget.close()
+    finally:
+        QFileDialog.getOpenFileName = staticmethod(original_get_open)
+        RegistrationService.batch_import_students = staticmethod(original_batch_import)
+        BatchImportResultDialog.exec = original_dialog_exec
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+        if app:
+            app.processEvents()
+
+def test_gui_import_persistence_after_restart():
+    print('\n=== 测试 GUI 导入数据持久化（重启验证） ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    course_data = {
+        'title': 'GUI 持久化测试课程',
+        'theme': 'GUI 测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_gui_persistence.csv')
+    create_test_csv(csv_path, [
+        ['持久学生1', 'GUIPER001', '技术部', '13800000001'],
+        ['持久学生2', 'GUIPER002', '产品部', '13800000002'],
+    ])
+
+    try:
+        result = RegistrationService.batch_import_students(course_id, csv_path)
+        assert result['success_count'] == 2
+
+        regs_before = RegistrationService.get_course_registrations(course_id)
+        count_before = len(regs_before)
+        ids_before = {r['employee_id'] for r in regs_before}
+        course_before = CourseService.get_course(course_id)
+
+        print('--- 模拟程序关闭后重启 ---')
+        from db.database import init_database
+        init_database()
+
+        widget = CourseDetailWidget(course_id)
+        widget.show()
+        app.processEvents()
+        reg_table = widget.reg_table
+        visible_rows = reg_table.rowCount()
+
+        assert visible_rows == count_before, f'重启后GUI显示报名数不一致，期望{count_before}，实际{visible_rows}'
+        print_test('重启后 GUI 显示报名记录一致', True, f'共{visible_rows}条')
+
+        regs_after = RegistrationService.get_course_registrations(course_id)
+        ids_after = {r['employee_id'] for r in regs_after}
+        assert ids_before == ids_after, '重启后学员信息不一致'
+        print_test('重启后学员信息完整', True, f'工号: {ids_after}')
+
+        course_after = CourseService.get_course(course_id)
+        assert course_after['capacity'] == course_before['capacity']
+        count_after = RegistrationDAO.count_by_course(course_id)
+        assert count_after == count_before, '重启后容量占用不一致'
+        print_test('重启后课程容量占用一致', True, f'{count_after}/{course_after["capacity"]}')
+
+        logs_after = ExceptionService.get_all_logs()
+        import_logs = [l for l in logs_after if l['type'] in ('import_validation_error', 'import_system_error')]
+        print_test('重启后异常日志完整', True, f'共{len(import_logs)}条导入相关日志')
+
+        widget.close()
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+        if app:
+            app.processEvents()
+
 def test_summary():
     print('\n' + '='*50)
     print('所有测试用例执行完成')
@@ -873,6 +1255,16 @@ if __name__ == '__main__':
         test_batch_import_result_export(export_course_id)
 
         test_batch_import_persistence(batch_course_id)
+
+        print('\n' + '='*50)
+        print('GUI 集成专项测试')
+        print('='*50)
+
+        test_gui_batch_import_button()
+        test_gui_import_result_dialog()
+        test_gui_import_result_export()
+        test_gui_import_trigger_end_to_end()
+        test_gui_import_persistence_after_restart()
 
         test_summary()
     finally:
