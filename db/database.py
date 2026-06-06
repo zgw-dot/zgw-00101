@@ -150,5 +150,42 @@ def init_database():
     )
     ''')
 
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS waiting_list (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id INTEGER NOT NULL,
+        student_id INTEGER NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL DEFAULT 'manual',
+        status TEXT NOT NULL DEFAULT 'waiting',
+        added_at TEXT NOT NULL,
+        processed_at TEXT,
+        note TEXT,
+        FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE,
+        FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+        UNIQUE(course_id, student_id, status)
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS waiting_list_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id INTEGER NOT NULL,
+        waiting_list_id INTEGER,
+        student_id INTEGER NOT NULL,
+        original_position INTEGER,
+        priority INTEGER,
+        source TEXT,
+        result TEXT NOT NULL,
+        failure_reason TEXT,
+        registration_id INTEGER,
+        processed_at TEXT NOT NULL,
+        FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE,
+        FOREIGN KEY (waiting_list_id) REFERENCES waiting_list(id) ON DELETE SET NULL,
+        FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+        FOREIGN KEY (registration_id) REFERENCES registrations(id) ON DELETE SET NULL
+    )
+    ''')
+
     conn.commit()
     conn.close()

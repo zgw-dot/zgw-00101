@@ -353,3 +353,102 @@ class ExportService:
                     ])
 
         return output_path
+
+    @staticmethod
+    def export_waiting_list_import_result(import_result, output_path=None):
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'exports'
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            safe_title = import_result.get('course_title', '').replace('/', '_').replace('\\', '_')
+            output_path = os.path.join(
+                output_dir,
+                f'候补导入结果_{safe_title}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            )
+
+        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+
+            writer.writerow(['候补名单导入结果'])
+            writer.writerow(['课程名称', import_result.get('course_title', '')])
+            writer.writerow(['导入时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            writer.writerow(['总行数', import_result.get('total', 0)])
+            writer.writerow(['成功', import_result.get('success_count', 0)])
+            writer.writerow(['失败', import_result.get('failure_count', 0)])
+            writer.writerow([])
+
+            writer.writerow([
+                '原始行号', '姓名', '工号', '部门', '联系方式', '优先级',
+                '处理结果', '失败原因', '候补ID'
+            ])
+
+            for row in import_result.get('rows', []):
+                writer.writerow([
+                    row.get('row_number', ''),
+                    row.get('name', ''),
+                    row.get('employee_id', ''),
+                    row.get('department', ''),
+                    row.get('phone', ''),
+                    row.get('priority', 0),
+                    '成功' if row.get('success') else '失败',
+                    row.get('failure_reason', ''),
+                    row.get('waiting_list_id', '')
+                ])
+
+        return output_path
+
+    @staticmethod
+    def export_auto_fill_result(fill_result, output_path=None):
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'exports'
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            safe_title = fill_result.get('course_title', '').replace('/', '_').replace('\\', '_')
+            output_path = os.path.join(
+                output_dir,
+                f'补位结果_{safe_title}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            )
+
+        source_map = {
+            'manual': '手动添加',
+            'csv_import': 'CSV导入',
+            'auto_full': '满员自动加入'
+        }
+
+        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+
+            writer.writerow(['自动补位结果'])
+            writer.writerow(['课程名称', fill_result.get('course_title', '')])
+            writer.writerow(['补位时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            writer.writerow(['可用名额', fill_result.get('available_slots', 0)])
+            writer.writerow(['处理总数', fill_result.get('total', 0)])
+            writer.writerow(['成功补位', fill_result.get('success_count', 0)])
+            writer.writerow(['补位失败', fill_result.get('failure_count', 0)])
+            writer.writerow([])
+
+            writer.writerow([
+                '原队列位置', '姓名', '工号', '部门', '联系方式',
+                '优先级', '候补来源', '处理结果', '失败原因', '报名ID'
+            ])
+
+            for row in fill_result.get('items', []):
+                source = source_map.get(row.get('source', ''), row.get('source', ''))
+                writer.writerow([
+                    row.get('original_position', ''),
+                    row.get('name', ''),
+                    row.get('employee_id', ''),
+                    row.get('department', ''),
+                    row.get('phone', ''),
+                    row.get('priority', 0),
+                    source,
+                    '成功' if row.get('result') == 'success' else '失败',
+                    row.get('failure_reason', ''),
+                    row.get('registration_id', '')
+                ])
+
+        return output_path

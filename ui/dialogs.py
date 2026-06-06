@@ -9,7 +9,8 @@ from PySide6.QtCore import Qt, QDateTime, QDate
 from PySide6.QtGui import QColor, QBrush
 from services import (
     CourseService, RegistrationService, AttendanceService,
-    ExportService, BatchOperationService, UndoManager, ValidationError
+    ExportService, BatchOperationService, UndoManager, WaitingListService,
+    ValidationError
 )
 from datetime import datetime, timedelta
 
@@ -1131,3 +1132,680 @@ class UndoDialog(QDialog):
             self.accept()
         except ValidationError as e:
             QMessageBox.warning(self, '撤销失败', str(e))
+
+
+class AddToWaitingListDialog(QDialog):
+    def __init__(self, course_id, parent=None):
+        super().__init__(parent)
+        self.course_id = course_id
+        self.setWindowTitle('添加候补')
+        self.resize(400, 350)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        course = CourseService.get_course(self.course_id)
+        course_info = QLabel(
+            f'目标课程：{course["title"]}\n'
+            f'当前已报名：{RegistrationService.get_course_registrations(self.course_id).__len__()}/{course["capacity"]} 人\n'
+            f'候补人数：{WaitingListService.get_waiting_count(self.course_id)} 人'
+        )
+        course_info.setStyleSheet('padding: 10px; background: #f0f0f0; border-radius: 5px;')
+        layout.addWidget(course_info)
+
+        form = QFormLayout()
+
+        self.name_edit = QLineEdit()
+        form.addRow('姓名*：', self.name_edit)
+
+        self.emp_id_edit = QLineEdit()
+        form.addRow('工号*：', self.emp_id_edit)
+
+        self.dept_edit = QLineEdit()
+        form.addRow('部门：', self.dept_edit)
+
+        self.phone_edit = QLineEdit()
+        form.addRow('电话：', self.phone_edit)
+
+        self.priority_spin = QSpinBox()
+        self.priority_spin.setRange(0, 100)
+        self.priority_spin.setValue(0)
+        self.priority_spin.setToolTip('优先级越高，补位时越先处理（0-100）')
+        form.addRow('优先级：', self.priority_spin)
+
+        self.note_edit = QLineEdit()
+        form.addRow('备注：', self.note_edit)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_data(self):
+        return {
+            'name': self.name_edit.text().strip(),
+            'employee_id': self.emp_id_edit.text().strip(),
+            'department': self.dept_edit.text().strip(),
+            'phone': self.phone_edit.text().strip(),
+            'priority': self.priority_spin.value(),
+            'note': self.note_edit.text().strip()
+        }
+
+    def accept(self):
+        data = self.get_data()
+        if not data['name'] or not data['employee_id']:
+            QMessageBox.warning(self, '提示', '请填写姓名和工号')
+            return
+
+        try:
+            WaitingListService.add_to_waiting_list(
+                self.course_id,
+                data,
+                data['priority'],
+                'manual',
+                data['note']
+            )
+            QMessageBox.information(self, '成功', '已添加到候补队列')
+            super().accept()
+        except ValidationError as e:
+            QMessageBox.warning(self, '添加失败', str(e))
+
+
+class WaitingListDialog(QDialog):
+    def __init__(self, course_id, parent=None):
+        super().__init__(parent)
+        self.course_id = course_id
+        self.setWindowTitle('候补名单管理')
+        self.resize(900, 600)
+        self.init_ui()
+        self.refresh()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.info_label = QLabel()
+        self.info_label.setStyleSheet('padding: 10px; background: #e3f2fd; border-radius: 5px;')
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        toolbar = QHBoxLayout()
+
+        add_btn = QPushButton('添加候补')
+        add_btn.setStyleSheet('background: #4caf50; color: white; padding: 6px 16px;')
+        add_btn.clicked.connect(self.add_waiting)
+        toolbar.addWidget(add_btn)
+
+        import_btn = QPushButton('导入候补')
+        import_btn.setStyleSheet('background: #ff9800; color: white; padding: 6px 16px;')
+        import_btn.clicked.connect(self.import_waiting)
+        toolbar.addWidget(import_btn)
+
+        auto_fill_btn = QPushButton('自动补位')
+        auto_fill_btn.setStyleSheet('background: #2196f3; color: white; padding: 6px 16px;')
+        auto_fill_btn.clicked.connect(self.auto_fill)
+        toolbar.addWidget(auto_fill_btn)
+
+        remove_btn = QPushButton('移除选中')
+        remove_btn.setStyleSheet('background: #f44336; color: white; padding: 6px 16px;')
+        remove_btn.clicked.connect(self.remove_selected)
+        toolbar.addWidget(remove_btn)
+
+        toolbar.addStretch()
+
+        refresh_btn = QPushButton('刷新')
+        refresh_btn.clicked.connect(self.refresh)
+        toolbar.addWidget(refresh_btn)
+
+        layout.addLayout(toolbar)
+
+        self.tabs = QTabWidget()
+
+        self.waiting_tab = QWidget()
+        waiting_layout = QVBoxLayout(self.waiting_tab)
+        self.waiting_table = QTableWidget()
+        self.waiting_table.setColumnCount(9)
+        self.waiting_table.setHorizontalHeaderLabels([
+            '选择', '队列位置', '工号', '姓名', '部门', '电话', '优先级', '来源', '加入时间'
+        ])
+        self.waiting_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.waiting_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        for i in range(2, 9):
+            self.waiting_table.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
+        self.waiting_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.waiting_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        waiting_layout.addWidget(self.waiting_table)
+        self.tabs.addTab(self.waiting_tab, '候补队列')
+
+        self.history_tab = QWidget()
+        history_layout = QVBoxLayout(self.history_tab)
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(9)
+        self.history_table.setHorizontalHeaderLabels([
+            '原位置', '工号', '姓名', '部门', '优先级', '来源',
+            '处理结果', '失败原因', '处理时间'
+        ])
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        history_layout.addWidget(self.history_table)
+        self.tabs.addTab(self.history_tab, '补位历史')
+
+        layout.addWidget(self.tabs, 1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+    def refresh(self):
+        course = CourseService.get_course(self.course_id)
+        waiting_count = WaitingListService.get_waiting_count(self.course_id)
+        registered_count = RegistrationService.get_course_registrations(self.course_id).__len__()
+        available_slots = WaitingListService.get_available_slots(self.course_id)
+
+        self.info_label.setText(
+            f'<b>{course["title"]}</b><br>'
+            f'已报名：{registered_count}/{course["capacity"]} 人 | '
+            f'可用名额：<b>{available_slots}</b> 个 | '
+            f'候补人数：<b>{waiting_count}</b> 人'
+        )
+
+        self.refresh_waiting_list()
+        self.refresh_history()
+
+    def refresh_waiting_list(self):
+        from PySide6.QtWidgets import QCheckBox
+        waiting_list = WaitingListService.get_waiting_list(self.course_id, 'waiting')
+        self.waiting_table.setRowCount(len(waiting_list))
+
+        source_map = {
+            'manual': '手动添加',
+            'csv_import': 'CSV导入',
+            'auto_full': '满员自动加入'
+        }
+
+        for row, item in enumerate(waiting_list):
+            checkbox_widget = QWidget()
+            checkbox_layout = QHBoxLayout(checkbox_widget)
+            checkbox_layout.setContentsMargins(0, 0, 0, 0)
+            checkbox_layout.setAlignment(Qt.AlignCenter)
+            checkbox = QCheckBox()
+            checkbox_layout.addWidget(checkbox)
+            self.waiting_table.setCellWidget(row, 0, checkbox_widget)
+
+            self.waiting_table.setItem(row, 1, QTableWidgetItem(str(item['position'])))
+            self.waiting_table.setItem(row, 2, QTableWidgetItem(item['employee_id']))
+            self.waiting_table.setItem(row, 3, QTableWidgetItem(item['name']))
+            self.waiting_table.setItem(row, 4, QTableWidgetItem(item.get('department', '')))
+            self.waiting_table.setItem(row, 5, QTableWidgetItem(item.get('phone', '')))
+
+            priority_item = QTableWidgetItem(str(item['priority']))
+            if item['priority'] > 0:
+                priority_item.setForeground(QBrush(QColor(255, 152, 0)))
+                priority_item.setFont(QFont('', -1, QFont.Bold))
+            self.waiting_table.setItem(row, 6, priority_item)
+
+            self.waiting_table.setItem(row, 7, QTableWidgetItem(
+                source_map.get(item['source'], item['source'])
+            ))
+            self.waiting_table.setItem(row, 8, QTableWidgetItem(item['added_at'][:19]))
+
+            self.waiting_table.item(row, 1).setData(Qt.UserRole, item['id'])
+
+    def refresh_history(self):
+        history = WaitingListService.get_fill_results(self.course_id)
+        self.history_table.setRowCount(len(history))
+
+        source_map = {
+            'manual': '手动添加',
+            'csv_import': 'CSV导入',
+            'auto_full': '满员自动加入'
+        }
+
+        for row, item in enumerate(history):
+            self.history_table.setItem(row, 0, QTableWidgetItem(str(item.get('original_position', ''))))
+            self.history_table.setItem(row, 1, QTableWidgetItem(item['employee_id']))
+            self.history_table.setItem(row, 2, QTableWidgetItem(item['name']))
+            self.history_table.setItem(row, 3, QTableWidgetItem(item.get('department', '')))
+            self.history_table.setItem(row, 4, QTableWidgetItem(str(item.get('priority', 0))))
+            self.history_table.setItem(row, 5, QTableWidgetItem(
+                source_map.get(item.get('source', ''), item.get('source', ''))
+            ))
+
+            result = item.get('result', '')
+            if result == 'success':
+                result_item = QTableWidgetItem('成功')
+                result_item.setForeground(QBrush(QColor(76, 175, 80)))
+                result_item.setBackground(QBrush(QColor(232, 245, 233)))
+            else:
+                result_item = QTableWidgetItem('失败')
+                result_item.setForeground(QBrush(QColor(244, 67, 54)))
+                result_item.setBackground(QBrush(QColor(255, 235, 238)))
+            self.history_table.setItem(row, 6, result_item)
+
+            failure_reason = QTableWidgetItem(item.get('failure_reason', ''))
+            if item.get('failure_reason'):
+                failure_reason.setForeground(QBrush(QColor(244, 67, 54)))
+            self.history_table.setItem(row, 7, failure_reason)
+
+            self.history_table.setItem(row, 8, QTableWidgetItem(item['processed_at'][:19]))
+
+    def add_waiting(self):
+        dialog = AddToWaitingListDialog(self.course_id, self)
+        if dialog.exec():
+            self.refresh()
+
+    def import_waiting(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            '选择 CSV 文件',
+            '',
+            'CSV 文件 (*.csv)'
+        )
+
+        if not file_path:
+            return
+
+        try:
+            result = WaitingListService.batch_import_waiting_list(self.course_id, file_path)
+            self.refresh()
+
+            dialog = WaitingImportResultDialog(result, self)
+            dialog.exec()
+        except ValidationError as e:
+            QMessageBox.warning(self, '导入失败', str(e))
+        except Exception as e:
+            QMessageBox.warning(self, '系统错误', f'导入过程中发生错误：{e}')
+
+    def auto_fill(self):
+        try:
+            available_slots = WaitingListService.get_available_slots(self.course_id)
+            if available_slots <= 0:
+                QMessageBox.information(self, '提示', '当前没有可用名额')
+                return
+
+            waiting_count = WaitingListService.get_waiting_count(self.course_id)
+            if waiting_count <= 0:
+                QMessageBox.information(self, '提示', '当前没有候补学员')
+                return
+
+            preview = WaitingListService.preview_auto_fill(self.course_id)
+            dialog = AutoFillPreviewDialog(preview, self)
+            if dialog.exec():
+                result = WaitingListService.execute_auto_fill(self.course_id)
+                self.refresh()
+
+                result_dialog = AutoFillResultDialog(result, self)
+                result_dialog.exec()
+        except ValidationError as e:
+            QMessageBox.warning(self, '补位失败', str(e))
+
+    def remove_selected(self):
+        selected_ids = []
+        for row in range(self.waiting_table.rowCount()):
+            cell_widget = self.waiting_table.cellWidget(row, 0)
+            if cell_widget:
+                checkbox = cell_widget.findChild(QCheckBox)
+                if checkbox and checkbox.isChecked():
+                    waiting_id = self.waiting_table.item(row, 1).data(Qt.UserRole)
+                    selected_ids.append(waiting_id)
+
+        if not selected_ids:
+            QMessageBox.information(self, '提示', '请先选择要移除的学员')
+            return
+
+        reply = QMessageBox.question(
+            self, '确认',
+            f'确定要移除选中的 {len(selected_ids)} 名候补学员吗？',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        removed_count = 0
+        for waiting_id in selected_ids:
+            try:
+                WaitingListService.remove_from_waiting_list(waiting_id)
+                removed_count += 1
+            except ValidationError as e:
+                QMessageBox.warning(self, '移除失败', str(e))
+
+        QMessageBox.information(self, '完成', f'已移除 {removed_count} 名学员')
+        self.refresh()
+
+
+class WaitingImportResultDialog(QDialog):
+    def __init__(self, import_result, parent=None):
+        super().__init__(parent)
+        self.import_result = import_result
+        self.setWindowTitle('候补导入结果')
+        self.resize(900, 600)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet('background: #f5f5f5; border-radius: 8px; padding: 15px;')
+        summary_layout = QVBoxLayout(summary_frame)
+
+        title = QLabel(f'课程：{self.import_result.get("course_title", "")}')
+        title.setStyleSheet('font-size: 16px; font-weight: bold;')
+        summary_layout.addWidget(title)
+
+        stats_layout = QHBoxLayout()
+        total_label = QLabel(f'总行数：<b>{self.import_result.get("total", 0)}</b>')
+        total_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(total_label)
+
+        success_count = self.import_result.get("success_count", 0)
+        success_label = QLabel(f'成功：<b><span style="color: #4caf50;">{success_count}</span></b>')
+        success_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(success_label)
+
+        failure_count = self.import_result.get("failure_count", 0)
+        failure_label = QLabel(f'失败：<b><span style="color: #f44336;">{failure_count}</span></b>')
+        failure_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(failure_label)
+
+        stats_layout.addStretch()
+        summary_layout.addLayout(stats_layout)
+        layout.addWidget(summary_frame)
+
+        detail_label = QLabel('处理明细：')
+        detail_label.setStyleSheet('font-size: 14px; font-weight: bold; margin-top: 10px;')
+        layout.addWidget(detail_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels([
+            '行号', '姓名', '工号', '部门', '联系方式', '优先级', '处理结果', '失败原因'
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+        rows = self.import_result.get('rows', [])
+        self.table.setRowCount(len(rows))
+
+        for row_idx, row_data in enumerate(rows):
+            self.table.setItem(row_idx, 0, QTableWidgetItem(str(row_data.get('row_number', ''))))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(row_data.get('name', '')))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(row_data.get('employee_id', '')))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(row_data.get('department', '')))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(row_data.get('phone', '')))
+            self.table.setItem(row_idx, 5, QTableWidgetItem(str(row_data.get('priority', 0))))
+
+            if row_data.get('success'):
+                result_item = QTableWidgetItem('成功')
+                result_item.setForeground(QBrush(QColor(76, 175, 80)))
+                result_item.setBackground(QBrush(QColor(232, 245, 233)))
+            else:
+                result_item = QTableWidgetItem('失败')
+                result_item.setForeground(QBrush(QColor(244, 67, 54)))
+                result_item.setBackground(QBrush(QColor(255, 235, 238)))
+            self.table.setItem(row_idx, 6, result_item)
+
+            failure_reason = row_data.get('failure_reason', '')
+            reason_item = QTableWidgetItem(failure_reason)
+            if failure_reason:
+                reason_item.setForeground(QBrush(QColor(244, 67, 54)))
+            self.table.setItem(row_idx, 7, reason_item)
+
+        layout.addWidget(self.table, 1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        export_btn = QPushButton('导出结果')
+        export_btn.setStyleSheet('background: #2196f3; color: white; padding: 8px 20px;')
+        export_btn.clicked.connect(self.export_result)
+        btn_layout.addWidget(export_btn)
+
+        close_btn = QPushButton('关闭')
+        close_btn.setStyleSheet('padding: 8px 20px;')
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+
+    def export_result(self):
+        try:
+            path = ExportService.export_waiting_list_import_result(self.import_result)
+            QMessageBox.information(self, '导出成功', f'导入结果已导出到：\n{path}')
+        except Exception as e:
+            QMessageBox.warning(self, '导出失败', str(e))
+
+
+class AutoFillPreviewDialog(QDialog):
+    def __init__(self, preview_data, parent=None):
+        super().__init__(parent)
+        self.preview_data = preview_data
+        self.setWindowTitle('补位预览')
+        self.resize(900, 600)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet('background: #fff3e0; border-radius: 8px; padding: 15px;')
+        summary_layout = QVBoxLayout(summary_frame)
+
+        title = QLabel('<h3>自动补位预览</h3>')
+        summary_layout.addWidget(title)
+
+        info_text = (
+            f'课程：<b>{self.preview_data.get("course_title", "")}</b><br>'
+            f'可用名额：<b>{self.preview_data.get("available_slots", 0)}</b> 个<br>'
+            f'候补总人数：{self.preview_data.get("total_waiting", 0)} 人<br>'
+            f'本次处理：{self.preview_data.get("available_slots", 0)} 人<br>'
+            f'预计可成功：<b><span style="color: #4caf50;">{self.preview_data.get("can_process_count", 0)}</span></b> 人<br>'
+            f'预计失败：<b><span style="color: #f44336;">{self.preview_data.get("available_slots", 0) - self.preview_data.get("can_process_count", 0)}</span></b> 人'
+        )
+        info_label = QLabel(info_text)
+        info_label.setWordWrap(True)
+        summary_layout.addWidget(info_label)
+
+        warnings = self.preview_data.get('warnings', [])
+        if warnings:
+            warning_label = QLabel(
+                '<b><span style="color: #f44336;">⚠️ 注意事项：</span></b>'
+            )
+            summary_layout.addWidget(warning_label)
+
+            warning_text = '<br>'.join([f'• {w}' for w in warnings])
+            warning_content = QLabel(warning_text)
+            warning_content.setStyleSheet('color: #e65100;')
+            warning_content.setWordWrap(True)
+            summary_layout.addWidget(warning_content)
+
+        layout.addWidget(summary_frame)
+
+        detail_label = QLabel('补位名单（按优先级和加入时间排序）：')
+        detail_label.setStyleSheet('font-size: 14px; font-weight: bold; margin-top: 10px;')
+        layout.addWidget(detail_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels([
+            '队列位置', '工号', '姓名', '部门', '优先级', '来源', '可否补位', '备注'
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+        items = self.preview_data.get('items', [])
+        self.table.setRowCount(len(items))
+
+        source_map = {
+            'manual': '手动添加',
+            'csv_import': 'CSV导入',
+            'auto_full': '满员自动加入'
+        }
+
+        for row_idx, item in enumerate(items):
+            self.table.setItem(row_idx, 0, QTableWidgetItem(str(item.get('position', ''))))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(item.get('employee_id', '')))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(item.get('name', '')))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(item.get('department', '')))
+
+            priority_item = QTableWidgetItem(str(item.get('priority', 0)))
+            if item.get('priority', 0) > 0:
+                priority_item.setForeground(QBrush(QColor(255, 152, 0)))
+                priority_item.setFont(QFont('', -1, QFont.Bold))
+            self.table.setItem(row_idx, 4, priority_item)
+
+            self.table.setItem(row_idx, 5, QTableWidgetItem(
+                source_map.get(item.get('source', ''), item.get('source', ''))
+            ))
+
+            if item.get('can_process', True):
+                can_item = QTableWidgetItem('✓ 可以补位')
+                can_item.setForeground(QBrush(QColor(76, 175, 80)))
+            else:
+                can_item = QTableWidgetItem('✗ 无法补位')
+                can_item.setForeground(QBrush(QColor(244, 67, 54)))
+            self.table.setItem(row_idx, 6, can_item)
+
+            remark_item = QTableWidgetItem(item.get('failure_reason', ''))
+            if item.get('failure_reason'):
+                remark_item.setForeground(QBrush(QColor(244, 67, 54)))
+            self.table.setItem(row_idx, 7, remark_item)
+
+        layout.addWidget(self.table, 1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        confirm_btn = QPushButton('确认执行补位')
+        confirm_btn.setStyleSheet(
+            'background: #2196f3; color: white; padding: 10px 30px; font-weight: bold;'
+        )
+        confirm_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(confirm_btn)
+
+        cancel_btn = QPushButton('取消')
+        cancel_btn.setStyleSheet('padding: 10px 30px;')
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+
+class AutoFillResultDialog(QDialog):
+    def __init__(self, fill_result, parent=None):
+        super().__init__(parent)
+        self.fill_result = fill_result
+        self.setWindowTitle('补位结果')
+        self.resize(900, 600)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet('background: #f5f5f5; border-radius: 8px; padding: 15px;')
+        summary_layout = QVBoxLayout(summary_frame)
+
+        title = QLabel('<h3>自动补位完成</h3>')
+        summary_layout.addWidget(title)
+
+        info_text = (
+            f'课程：<b>{self.fill_result.get("course_title", "")}</b><br>'
+            f'可用名额：{self.fill_result.get("available_slots", 0)} 个<br>'
+            f'处理总数：{self.fill_result.get("total", 0)} 人<br>'
+            f'成功补位：<b><span style="color: #4caf50;">{self.fill_result.get("success_count", 0)}</span></b> 人<br>'
+            f'补位失败：<b><span style="color: #f44336;">{self.fill_result.get("failure_count", 0)}</span></b> 人'
+        )
+        info_label = QLabel(info_text)
+        info_label.setWordWrap(True)
+        summary_layout.addWidget(info_label)
+
+        layout.addWidget(summary_frame)
+
+        detail_label = QLabel('处理明细：')
+        detail_label.setStyleSheet('font-size: 14px; font-weight: bold; margin-top: 10px;')
+        layout.addWidget(detail_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(9)
+        self.table.setHorizontalHeaderLabels([
+            '原队列位置', '工号', '姓名', '部门', '优先级', '来源',
+            '处理结果', '失败原因', '报名ID'
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+        items = self.fill_result.get('items', [])
+        self.table.setRowCount(len(items))
+
+        source_map = {
+            'manual': '手动添加',
+            'csv_import': 'CSV导入',
+            'auto_full': '满员自动加入'
+        }
+
+        for row_idx, item in enumerate(items):
+            self.table.setItem(row_idx, 0, QTableWidgetItem(str(item.get('original_position', ''))))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(item.get('employee_id', '')))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(item.get('name', '')))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(item.get('department', '')))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(str(item.get('priority', 0))))
+            self.table.setItem(row_idx, 5, QTableWidgetItem(
+                source_map.get(item.get('source', ''), item.get('source', ''))
+            ))
+
+            if item.get('result') == 'success':
+                result_item = QTableWidgetItem('成功')
+                result_item.setForeground(QBrush(QColor(76, 175, 80)))
+                result_item.setBackground(QBrush(QColor(232, 245, 233)))
+            else:
+                result_item = QTableWidgetItem('失败')
+                result_item.setForeground(QBrush(QColor(244, 67, 54)))
+                result_item.setBackground(QBrush(QColor(255, 235, 238)))
+            self.table.setItem(row_idx, 6, result_item)
+
+            failure_reason = item.get('failure_reason', '')
+            reason_item = QTableWidgetItem(failure_reason)
+            if failure_reason:
+                reason_item.setForeground(QBrush(QColor(244, 67, 54)))
+            self.table.setItem(row_idx, 7, reason_item)
+
+            self.table.setItem(row_idx, 8, QTableWidgetItem(
+                str(item.get('registration_id', '')) if item.get('registration_id') else ''
+            ))
+
+        layout.addWidget(self.table, 1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        export_btn = QPushButton('导出结果')
+        export_btn.setStyleSheet('background: #2196f3; color: white; padding: 8px 20px;')
+        export_btn.clicked.connect(self.export_result)
+        btn_layout.addWidget(export_btn)
+
+        close_btn = QPushButton('关闭')
+        close_btn.setStyleSheet('padding: 8px 20px;')
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+
+    def export_result(self):
+        try:
+            path = ExportService.export_auto_fill_result(self.fill_result)
+            QMessageBox.information(self, '导出成功', f'补位结果已导出到：\n{path}')
+        except Exception as e:
+            QMessageBox.warning(self, '导出失败', str(e))

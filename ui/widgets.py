@@ -11,14 +11,16 @@ from datetime import datetime, timedelta
 from services import (
     CourseService, RegistrationService, AttendanceService,
     ExportService, ExceptionService, BatchOperationService,
-    UndoManager, ValidationError
+    UndoManager, WaitingListService, ValidationError
 )
 from .dialogs import (
     CourseDialog, RegistrationDialog, TransferDialog,
     TransferReviewDialog, CheckInDialog, MakeupRequestDialog,
     MakeupReviewDialog, DateRangeDialog, BatchImportResultDialog,
     BatchOperationConfirmDialog, BatchOperationResultDialog,
-    BatchTargetCourseDialog, BatchTargetStatusDialog
+    BatchTargetCourseDialog, BatchTargetStatusDialog,
+    WaitingListDialog, AddToWaitingListDialog, WaitingImportResultDialog,
+    AutoFillPreviewDialog, AutoFillResultDialog
 )
 
 class CourseCalendarWidget(QWidget):
@@ -311,6 +313,11 @@ class CourseDetailWidget(QWidget):
         export_btn.clicked.connect(self.export_attendance)
         toolbar.addWidget(export_btn)
 
+        waiting_list_btn = QPushButton('候补名单')
+        waiting_list_btn.setStyleSheet('background: #9c27b0; color: white;')
+        waiting_list_btn.clicked.connect(self.show_waiting_list)
+        toolbar.addWidget(waiting_list_btn)
+
         toolbar.addStretch()
 
         back_btn = QPushButton('返回')
@@ -393,6 +400,9 @@ class CourseDetailWidget(QWidget):
 
         summary = CourseService.get_course_attendance_summary(self.course_id)
         status_text = '已发布' if course['status'] == 'published' else '草稿'
+        waiting_count = WaitingListService.get_waiting_count(self.course_id)
+        available_slots = WaitingListService.get_available_slots(self.course_id)
+
         self.info_label.setText(
             f'<b>{course["title"]}</b><br>'
             f'主题：{course["theme"]} | 状态：{status_text}<br>'
@@ -400,6 +410,8 @@ class CourseDetailWidget(QWidget):
             f'时间：{course["start_time"][:16]} ~ {course["end_time"][:16]}<br>'
             f'报名截止：{course["registration_deadline"][:16]}<br>'
             f'报名：{summary["total_registered"]}/{course["capacity"]} 人 | '
+            f'可用名额：<b>{available_slots}</b> 个 | '
+            f'候补：<b>{waiting_count}</b> 人<br>'
             f'出勤：{summary["present"]} | 缺勤：{summary["absent"]} | '
             f'未签：{summary["pending"]} | 补签：{summary["makeup"]}'
         )
@@ -751,6 +763,11 @@ class CourseDetailWidget(QWidget):
                     f'批量操作结果已导出到：{file_path}')
         except Exception as e:
             QMessageBox.warning(self, '导出失败', f'导出失败：{e}')
+
+    def show_waiting_list(self):
+        dialog = WaitingListDialog(self.course_id, self)
+        dialog.exec()
+        self.refresh()
 
 class TransferReviewWidget(QWidget):
     def __init__(self, parent=None):

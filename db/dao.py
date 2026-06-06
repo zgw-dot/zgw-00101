@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import datetime
 from .database import get_connection
 
@@ -768,6 +769,208 @@ class RegistrationDAOExt:
         WHERE r.course_id=?
         ORDER BY s.name
         ''', (course_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+
+class WaitingListDAO:
+    @staticmethod
+    def create(course_id, student_id, priority=0, source='manual', note=''):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+            INSERT INTO waiting_list (
+                course_id, student_id, priority, source, status, added_at, note
+            ) VALUES (?, ?, ?, ?, 'waiting', ?, ?)
+            ''', (course_id, student_id, priority, source, now, note))
+            conn.commit()
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_id(waiting_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT w.*, s.name, s.employee_id, s.department, s.phone,
+               c.title as course_title
+        FROM waiting_list w
+        JOIN students s ON w.student_id = s.id
+        JOIN courses c ON w.course_id = c.id
+        WHERE w.id=?
+        ''', (waiting_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row_to_dict(row)
+
+    @staticmethod
+    def get_by_course(course_id, status='waiting'):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT w.*, s.name, s.employee_id, s.department, s.phone
+        FROM waiting_list w
+        JOIN students s ON w.student_id = s.id
+        WHERE w.course_id=? AND w.status=?
+        ORDER BY w.priority DESC, w.added_at ASC
+        ''', (course_id, status))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+    @staticmethod
+    def get_all(status='waiting'):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT w.*, s.name, s.employee_id, s.department, s.phone,
+               c.title as course_title
+        FROM waiting_list w
+        JOIN students s ON w.student_id = s.id
+        JOIN courses c ON w.course_id = c.id
+        WHERE w.status=?
+        ORDER BY c.title, w.priority DESC, w.added_at ASC
+        ''', (status,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+    @staticmethod
+    def count_by_course(course_id, status='waiting'):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT COUNT(*) as count FROM waiting_list
+        WHERE course_id=? AND status=?
+        ''', (course_id, status))
+        row = cursor.fetchone()
+        conn.close()
+        return row['count'] if row else 0
+
+    @staticmethod
+    def exists(course_id, student_id, status='waiting'):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT id FROM waiting_list
+        WHERE course_id=? AND student_id=? AND status=?
+        ''', (course_id, student_id, status))
+        row = cursor.fetchone()
+        conn.close()
+        return row is not None
+
+    @staticmethod
+    def update_status(waiting_id, status, note=''):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        UPDATE waiting_list
+        SET status=?, processed_at=?, note=?
+        WHERE id=?
+        ''', (status, now, note, waiting_id))
+        conn.commit()
+        updated = cursor.rowcount > 0
+        conn.close()
+        return updated
+
+    @staticmethod
+    def delete(waiting_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM waiting_list WHERE id=?', (waiting_id,))
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        conn.close()
+        return deleted
+
+    @staticmethod
+    def get_position(waiting_id):
+        waiting = WaitingListDAO.get_by_id(waiting_id)
+        if not waiting:
+            return None
+        course_id = waiting['course_id']
+        all_waiting = WaitingListDAO.get_by_course(course_id, 'waiting')
+        for idx, w in enumerate(all_waiting, 1):
+            if w['id'] == waiting_id:
+                return idx
+        return None
+
+
+class WaitingListResultDAO:
+    @staticmethod
+    def create(course_id, waiting_list_id, student_id, original_position,
+               priority, source, result, failure_reason=None, registration_id=None):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT INTO waiting_list_results (
+            course_id, waiting_list_id, student_id, original_position,
+            priority, source, result, failure_reason, registration_id, processed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (course_id, waiting_list_id, student_id, original_position,
+              priority, source, result, failure_reason, registration_id, now))
+        conn.commit()
+        result_id = cursor.lastrowid
+        conn.close()
+        return result_id
+
+    @staticmethod
+    def get_by_course(course_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT wr.*, s.name, s.employee_id, s.department, s.phone,
+               c.title as course_title
+        FROM waiting_list_results wr
+        JOIN students s ON wr.student_id = s.id
+        JOIN courses c ON wr.course_id = c.id
+        WHERE wr.course_id=?
+        ORDER BY wr.processed_at DESC
+        ''', (course_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+    @staticmethod
+    def get_latest_by_course(course_id, limit=100):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT wr.*, s.name, s.employee_id, s.department, s.phone,
+               c.title as course_title
+        FROM waiting_list_results wr
+        JOIN students s ON wr.student_id = s.id
+        JOIN courses c ON wr.course_id = c.id
+        WHERE wr.course_id=?
+        ORDER BY wr.processed_at DESC
+        LIMIT ?
+        ''', (course_id, limit))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+    @staticmethod
+    def get_all(limit=1000):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT wr.*, s.name, s.employee_id, s.department, s.phone,
+               c.title as course_title
+        FROM waiting_list_results wr
+        JOIN students s ON wr.student_id = s.id
+        JOIN courses c ON wr.course_id = c.id
+        ORDER BY wr.processed_at DESC
+        LIMIT ?
+        ''', (limit,))
         rows = cursor.fetchall()
         conn.close()
         return rows_to_dict_list(rows)

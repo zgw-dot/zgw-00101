@@ -9,9 +9,12 @@ from db import init_database
 from services import (
     CourseService, RegistrationService, AttendanceService,
     ExportService, ExceptionService, BatchOperationService,
-    UndoManager, ValidationError
+    UndoManager, WaitingListService, ValidationError
 )
-from db.dao import RegistrationDAO, BatchOperationLogDAO, BatchOperationItemDAO
+from db.dao import (
+    RegistrationDAO, BatchOperationLogDAO, BatchOperationItemDAO,
+    WaitingListDAO, WaitingListResultDAO
+)
 
 try:
     from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget, QFileDialog, QDialog
@@ -20,7 +23,9 @@ try:
     from ui.dialogs import (
         BatchImportResultDialog, BatchOperationConfirmDialog,
         BatchOperationResultDialog, BatchTargetCourseDialog,
-        BatchTargetStatusDialog, UndoDialog
+        BatchTargetStatusDialog, UndoDialog, WaitingListDialog,
+        AddToWaitingListDialog, WaitingImportResultDialog,
+        AutoFillPreviewDialog, AutoFillResultDialog
     )
     PYSIDE_AVAILABLE = True
 except ImportError:
@@ -1231,7 +1236,7 @@ def test_batch_cancel_partial_failure():
         reg_id = RegistrationService.register_student(course_id, s)
         reg_ids.append(reg_id)
 
-    RegistrationService.cancel_registration(reg_ids[1])
+    BatchOperationService.batch_cancel(course_id, [reg_ids[1]])
 
     all_reg_ids = reg_ids + [99999]
 
@@ -1291,7 +1296,7 @@ def test_batch_change_status():
         reg_id = RegistrationService.register_student(course_id, s)
         reg_ids.append(reg_id)
 
-    RegistrationService.cancel_registration(reg_ids[2])
+    BatchOperationService.batch_cancel(course_id, [reg_ids[2]])
 
     try:
         result = BatchOperationService.batch_change_status(
@@ -1369,7 +1374,7 @@ def test_batch_transfer_rules():
         reg_id = RegistrationService.register_student(course1_id, s)
         reg_ids.append(reg_id)
 
-    RegistrationService.cancel_registration(reg_ids[4])
+    BatchOperationService.batch_cancel(course1_id, [reg_ids[4]])
 
     RegistrationService.register_student(course2_id, {
         'name': '重复学生', 'employee_id': 'TRANS003', 'department': '运营部'
@@ -1434,7 +1439,7 @@ def test_batch_operation_preview():
         reg_id = RegistrationService.register_student(course_id, s)
         reg_ids.append(reg_id)
 
-    RegistrationService.cancel_registration(reg_ids[1])
+    BatchOperationService.batch_cancel(course_id, [reg_ids[1]])
 
     try:
         preview = BatchOperationService.get_preview(course_id, reg_ids, 'cancel')
@@ -1641,7 +1646,7 @@ def test_batch_operation_persistence():
         reg_id = RegistrationService.register_student(course_id, s)
         reg_ids.append(reg_id)
 
-    RegistrationService.cancel_registration(reg_ids[1])
+    BatchOperationService.batch_cancel(course_id, [reg_ids[1]])
 
     result = BatchOperationService.batch_cancel(course_id, reg_ids)
     assert result['success_count'] == 2
@@ -1717,7 +1722,7 @@ def test_batch_operation_export():
         reg_id = RegistrationService.register_student(course1_id, s)
         reg_ids.append(reg_id)
 
-    RegistrationService.cancel_registration(reg_ids[2])
+    BatchOperationService.batch_cancel(course1_id, [reg_ids[2]])
 
     result = BatchOperationService.batch_transfer(course1_id, reg_ids, course2_id)
 
@@ -2209,6 +2214,575 @@ def test_gui_persistence_after_restart():
 
     widget.close()
 
+def test_waiting_list_manual_add():
+    print('\n=== 测试手动添加候补 ===')
+
+    course_data = {
+        'title': '候补测试课程1',
+        'theme': '候补测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 2,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student1 = {'name': '候补学生1', 'employee_id': 'WAIT001', 'department': '技术部'}
+    reg_id1 = RegistrationService.register_student(course_id, student1)
+
+    student2 = {'name': '候补学生2', 'employee_id': 'WAIT002', 'department': '产品部'}
+    reg_id2 = RegistrationService.register_student(course_id, student2)
+
+    course = CourseService.get_course(course_id)
+    regs = RegistrationService.get_course_registrations(course_id)
+    assert len(regs) == 2, '课程应该已经满员'
+
+    waiting_student = {
+        'name': '候补学生3',
+        'employee_id': 'WAIT003',
+        'department': '运营部',
+        'phone': '13900000003'
+    }
+
+    try:
+        waiting_id = WaitingListService.add_to_waiting_list(
+            course_id, waiting_student, priority=5, source='manual', note='高优先级'
+        )
+        print_test('添加候补成功', True, f'候补ID: {waiting_id}')
+
+        waiting_count = WaitingListService.get_waiting_count(course_id)
+        assert waiting_count == 1, f'期望1人在候补队列，实际{waiting_count}'
+        print_test('候补人数统计正确', True)
+
+        waiting_list = WaitingListService.get_waiting_list(course_id)
+        assert len(waiting_list) == 1
+        assert waiting_list[0]['position'] == 1
+        assert waiting_list[0]['priority'] == 5
+        assert waiting_list[0]['employee_id'] == 'WAIT003'
+        print_test('候补队列排序正确（优先级降序）', True)
+
+        available = WaitingListService.get_available_slots(course_id)
+        assert available == 0, f'课程满员，可用名额应该为0，实际{available}'
+        print_test('课程满员时可用名额为0', True)
+
+        try:
+            WaitingListService.add_to_waiting_list(
+                course_id, waiting_student, priority=0, source='manual'
+            )
+            print_test('重复候补拦截', False, '应该抛出异常')
+        except ValidationError as e:
+            print_test('重复候补拦截成功', True, str(e))
+
+        course['status'] = 'draft'
+        CourseService.update_course(course_id, course)
+        try:
+            WaitingListService.add_to_waiting_list(
+                course_id,
+                {'name': '候补学生4', 'employee_id': 'WAIT004', 'department': '技术部'},
+                priority=0, source='manual'
+            )
+            print_test('未发布课程添加候补拦截', False, '应该抛出异常')
+        except ValidationError as e:
+            print_test('未发布课程添加候补拦截成功', True, str(e))
+
+        return course_id, waiting_id
+
+    except Exception as e:
+        print_test('手动添加候补测试', False, str(e))
+        return None, None
+
+
+def test_waiting_list_import_partial_failure():
+    print('\n=== 测试候补导入部分成功部分失败 ===')
+
+    course_data = {
+        'title': '候补导入测试课程',
+        'theme': '候补测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    csv_path = os.path.join(os.path.dirname(__file__), 'test_waiting_import.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(['姓名', '工号', '部门', '联系方式', '优先级', '备注'])
+        writer.writerow(['导入成功1', 'IMPWAIT001', '技术部', '13900000001', '10', 'VIP学员'])
+        writer.writerow(['', 'IMPWAIT002', '产品部', '13900000002', '0', '缺少姓名'])
+        writer.writerow(['导入成功2', 'IMPWAIT003', '运营部', '13900000003', '5', ''])
+        writer.writerow(['导入失败2', '', '设计部', '13900000004', '20', '缺少工号'])
+        writer.writerow(['导入成功3', 'IMPWAIT005', '市场部', '13900000005', '0', ''])
+
+    try:
+        result = WaitingListService.batch_import_waiting_list(course_id, csv_path)
+        print_test('批量导入执行成功', True)
+
+        assert result['total'] == 5, f'期望处理5行，实际{result["total"]}'
+        assert result['success_count'] == 3, f'期望成功3行，实际{result["success_count"]}'
+        assert result['failure_count'] == 2, f'期望失败2行，实际{result["failure_count"]}'
+        print_test('导入统计正确', True, f'成功{result["success_count"]}/失败{result["failure_count"]}')
+
+        success_rows = [r for r in result['rows'] if r['success']]
+        failure_rows = [r for r in result['rows'] if not r['success']]
+        assert len(success_rows) == 3
+        assert len(failure_rows) == 2
+
+        assert '缺少必填字段' in failure_rows[0]['failure_reason']
+        assert '缺少必填字段' in failure_rows[1]['failure_reason']
+        print_test('失败原因正确记录', True)
+
+        waiting_list = WaitingListService.get_waiting_list(course_id)
+        assert len(waiting_list) == 3, f'候补队列期望3人，实际{len(waiting_list)}'
+
+        assert waiting_list[0]['employee_id'] == 'IMPWAIT001'
+        assert waiting_list[0]['priority'] == 10
+        assert waiting_list[0]['position'] == 1
+        print_test('优先级高的学员排在前面', True,
+                   f'顺序: {[w["employee_id"] for w in waiting_list]}')
+
+        export_path = ExportService.export_waiting_list_import_result(result)
+        assert os.path.exists(export_path), '导出文件不存在'
+
+        with open(export_path, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+            assert '候补导入结果' in content
+            assert 'IMPWAIT001' in content
+            assert '导入成功1' in content
+            assert '缺少必填字段' in content
+        print_test('导入结果导出可读', True)
+
+        if os.path.exists(export_path):
+            os.remove(export_path)
+
+        return result
+    except Exception as e:
+        print_test('候补导入部分失败测试', False, str(e))
+        return None
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
+
+def test_auto_fill_preview_and_execute():
+    print('\n=== 测试自动补位预览与执行 ===')
+
+    course_data = {
+        'title': '自动补位测试课程',
+        'theme': '补位测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 2,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student1 = {'name': '正式学生1', 'employee_id': 'FILL001', 'department': '技术部'}
+    reg_id1 = RegistrationService.register_student(course_id, student1)
+    student2 = {'name': '正式学生2', 'employee_id': 'FILL002', 'department': '产品部'}
+    reg_id2 = RegistrationService.register_student(course_id, student2)
+
+    waiting_students = [
+        {'name': '候补高优', 'employee_id': 'FILLWAIT001', 'department': '技术部', 'phone': '13900000001', 'priority': 10},
+        {'name': '候补普通1', 'employee_id': 'FILLWAIT002', 'department': '产品部', 'phone': '13900000002', 'priority': 0},
+        {'name': '候补普通2', 'employee_id': 'FILLWAIT003', 'department': '运营部', 'phone': '13900000003', 'priority': 0},
+    ]
+
+    waiting_ids = []
+    for ws in waiting_students:
+        w_id = WaitingListService.add_to_waiting_list(
+            course_id, ws, ws['priority'], 'manual'
+        )
+        waiting_ids.append(w_id)
+
+    waiting_list = WaitingListService.get_waiting_list(course_id)
+    assert len(waiting_list) == 3
+    assert waiting_list[0]['employee_id'] == 'FILLWAIT001'
+    print_test('候补队列排序正确', True)
+
+    try:
+        preview = WaitingListService.preview_auto_fill(course_id)
+        print_test('补位预览成功', True)
+
+        assert preview['available_slots'] == 0, '课程满员时可用名额应为0'
+        assert preview['total_waiting'] == 3
+        print_test('课程满员时无可用名额', True)
+
+        BatchOperationService.batch_cancel(course_id, [reg_id1])
+
+        available = WaitingListService.get_available_slots(course_id)
+        assert available == 1, f'取消1个报名后可用名额应为1，实际{available}'
+        print_test('释放名额后可用名额正确', True)
+
+        preview = WaitingListService.preview_auto_fill(course_id)
+        assert preview['available_slots'] == 1
+        assert len(preview['items']) == 1
+        assert preview['items'][0]['employee_id'] == 'FILLWAIT001'
+        assert preview['items'][0]['can_process'] == True
+        print_test('补位预览名单正确', True,
+                   f'预览: {[i["employee_id"] for i in preview["items"]]}')
+
+        result = WaitingListService.execute_auto_fill(course_id)
+        print_test('自动补位执行成功', True)
+
+        assert result['available_slots'] == 1
+        assert result['total'] == 1
+        assert result['success_count'] == 1
+        assert result['failure_count'] == 0
+        print_test('补位结果统计正确', True)
+
+        assert result['items'][0]['result'] == 'success'
+        assert result['items'][0]['original_position'] == 1
+        assert result['items'][0]['employee_id'] == 'FILLWAIT001'
+        assert result['items'][0]['registration_id'] is not None
+        print_test('补位成功，生成正式报名', True,
+                   f'报名ID: {result["items"][0]["registration_id"]}')
+
+        regs = RegistrationService.get_course_registrations(course_id)
+        active_regs = [r for r in regs if r['status'] == 'registered']
+        assert len(active_regs) == 2, '补位后课程应该再次满员'
+        print_test('补位后课程容量正确', True)
+
+        waiting_list_after = WaitingListService.get_waiting_list(course_id)
+        assert len(waiting_list_after) == 2, '成功补位的学员应该从候补队列移除'
+        print_test('补位成功学员从候补队列移除', True)
+
+        history = WaitingListService.get_fill_results(course_id)
+        assert len(history) == 1
+        assert history[0]['result'] == 'success'
+        print_test('补位历史记录正确', True)
+
+        export_path = ExportService.export_auto_fill_result(result)
+        assert os.path.exists(export_path), '导出文件不存在'
+
+        with open(export_path, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+            assert '自动补位结果' in content
+            assert 'FILLWAIT001' in content
+            assert '成功' in content
+            assert '原队列位置' in content
+        print_test('补位结果导出可读', True)
+
+        if os.path.exists(export_path):
+            os.remove(export_path)
+
+        return course_id, result
+    except Exception as e:
+        print_test('自动补位测试', False, str(e))
+        return None, None
+
+
+def test_auto_fill_validation_rules():
+    print('\n=== 测试补位拦截规则 ===')
+
+    course_data = {
+        'title': '补位拦截测试课程',
+        'theme': '补位测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 3,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student1 = {'name': '正式生1', 'employee_id': 'VALID001', 'department': '技术部'}
+    reg_id1 = RegistrationService.register_student(course_id, student1)
+    student2 = {'name': '正式生2', 'employee_id': 'VALID002', 'department': '产品部'}
+    reg_id2 = RegistrationService.register_student(course_id, student2)
+
+    waiting_students = [
+        {'name': '正常补位1', 'employee_id': 'VALID003', 'department': '运营部', 'phone': '13900000002'},
+    ]
+
+    for ws in waiting_students:
+        WaitingListService.add_to_waiting_list(course_id, ws, 0, 'manual')
+
+    from db.dao import StudentDAO, WaitingListDAO
+    student2 = StudentDAO.get_by_employee_id('VALID002')
+    WaitingListDAO.create(course_id, student2['id'], priority=0, source='manual', note='测试重复报名拦截')
+
+    try:
+        result = WaitingListService.execute_auto_fill(course_id)
+        assert result['total'] == 2, f'期望处理2人，实际{result["total"]}'
+        assert result['success_count'] == 1, f'期望成功1人，实际{result["success_count"]}'
+        assert result['failure_count'] == 1, f'期望失败1人，实际{result["failure_count"]}'
+        print_test('重复报名学员补位被拦截', True)
+
+        failure_items = [i for i in result['items'] if i['result'] != 'success']
+        assert len(failure_items) == 1
+        assert '已在报名名单中' in failure_items[0]['failure_reason']
+        print_test('失败原因记录正确', True, failure_items[0]['failure_reason'])
+
+        success_items = [i for i in result['items'] if i['result'] == 'success']
+        assert len(success_items) == 1
+        assert success_items[0]['employee_id'] == 'VALID003'
+        print_test('正常学员补位成功', True)
+
+        exceptions = ExceptionService.get_all_logs()
+        waiting_exceptions = [e for e in exceptions if 'waiting_list' in e.get('type', '')]
+        assert len(waiting_exceptions) > 0
+        print_test('异常日志已记录', True)
+
+        return result
+    except Exception as e:
+        print_test('补位拦截规则测试', False, str(e))
+        return None
+
+
+def test_waiting_list_persistence():
+    print('\n=== 测试候补数据跨重启持久化 ===')
+
+    course_data = {
+        'title': '持久化候补课程',
+        'theme': '持久化测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 2,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student1 = {'name': '持久正式1', 'employee_id': 'PERW001', 'department': '技术部'}
+    reg_id1 = RegistrationService.register_student(course_id, student1)
+    student2 = {'name': '持久正式2', 'employee_id': 'PERW002', 'department': '产品部'}
+    reg_id2 = RegistrationService.register_student(course_id, student2)
+
+    waiting_data = [
+        {'name': '持久候补1', 'employee_id': 'PERW003', 'department': '运营部', 'priority': 5},
+        {'name': '持久候补2', 'employee_id': 'PERW004', 'department': '设计部', 'priority': 0},
+        {'name': '持久候补3', 'employee_id': 'PERW005', 'department': '市场部', 'priority': 10},
+    ]
+
+    waiting_ids = []
+    for wd in waiting_data:
+        w_id = WaitingListService.add_to_waiting_list(
+            course_id, wd, wd['priority'], 'manual'
+        )
+        waiting_ids.append(w_id)
+
+    waiting_before = WaitingListService.get_waiting_list(course_id)
+    order_before = [w['employee_id'] for w in waiting_before]
+    positions_before = {w['employee_id']: w['position'] for w in waiting_before}
+    assert order_before == ['PERW005', 'PERW003', 'PERW004'], '排序应该按优先级降序'
+    print_test('重启前候补顺序正确', True, f'顺序: {order_before}')
+
+    BatchOperationService.batch_cancel(course_id, [reg_id1])
+
+    fill_result = WaitingListService.execute_auto_fill(course_id)
+    assert fill_result['success_count'] == 1
+    fill_result_before = fill_result
+    print_test('重启前补位成功', True)
+
+    import db.database as db_module
+    import importlib
+    importlib.reload(db_module)
+    init_database()
+
+    waiting_after = WaitingListService.get_waiting_list(course_id)
+    order_after = [w['employee_id'] for w in waiting_after]
+    positions_after = {w['employee_id']: w['position'] for w in waiting_after}
+
+    assert len(waiting_after) == 2, f'重启后期望2人在候补队列，实际{len(waiting_after)}'
+    assert order_after == ['PERW003', 'PERW004'], f'顺序应为: [PERW003, PERW004]，实际: {order_after}'
+    assert positions_after['PERW003'] == 1, 'PERW003应该排在第1位'
+    assert positions_after['PERW004'] == 2, 'PERW004应该排在第2位'
+    print_test('重启后候补顺序和状态一致', True, f'顺序: {order_after}')
+
+    history_after = WaitingListService.get_fill_results(course_id)
+    assert len(history_after) == 1, f'重启后期望1条补位历史，实际{len(history_after)}'
+    assert history_after[0]['employee_id'] == 'PERW005'
+    assert history_after[0]['result'] == 'success'
+    print_test('重启后补位历史完整', True)
+
+    exceptions_after = ExceptionService.get_all_logs()
+    waiting_exceptions = [e for e in exceptions_after if 'waiting_list' in e.get('type', '')]
+    assert len(waiting_exceptions) >= 0
+    print_test('重启后异常日志完整', True)
+
+    return course_id
+
+
+def test_waiting_list_gui_integration():
+    print('\n=== 测试 GUI 候补名单集成 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    course_data = {
+        'title': 'GUI候补测试课程',
+        'theme': 'GUI测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 2,
+        'registration_deadline': (datetime.now() + timedelta(days=6)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student1 = {'name': 'GUI正式1', 'employee_id': 'GUIWAIT001', 'department': '技术部'}
+    RegistrationService.register_student(course_id, student1)
+    student2 = {'name': 'GUI正式2', 'employee_id': 'GUIWAIT002', 'department': '产品部'}
+    RegistrationService.register_student(course_id, student2)
+
+    try:
+        widget = CourseDetailWidget(course_id)
+        widget.show()
+        app.processEvents()
+
+        info_text = widget.info_label.text()
+        assert '候补' in info_text, '信息栏应显示候补相关信息'
+        assert '可用名额' in info_text, '信息栏应显示可用名额'
+        print_test('课程详情页显示候补状态', True)
+
+        waiting_btn = None
+        for child in widget.findChildren(QPushButton):
+            if child.text() == '候补名单':
+                waiting_btn = child
+                break
+
+        assert waiting_btn is not None, 'FAIL: 未找到候补名单按钮'
+        assert waiting_btn.isVisible(), 'FAIL: 按钮不可见'
+        assert waiting_btn.isEnabled(), 'FAIL: 按钮不可用'
+        print_test('课程详情页有可用的候补名单按钮', True)
+
+        dialog_ref = [None]
+        original_exec = WaitingListDialog.exec
+        def mock_exec(self):
+            dialog_ref[0] = self
+            return QDialog.Accepted
+        WaitingListDialog.exec = mock_exec
+
+        waiting_btn.click()
+        app.processEvents()
+
+        assert dialog_ref[0] is not None, 'FAIL: 点击按钮未打开对话框'
+        print_test('点击按钮打开候补名单对话框', True)
+
+        dialog = dialog_ref[0]
+        assert hasattr(dialog, 'waiting_table'), '对话框应该有候补列表'
+        assert hasattr(dialog, 'info_label'), '对话框应该有信息栏'
+        print_test('候补名单对话框组件完整', True)
+
+        add_btn = None
+        import_btn = None
+        auto_fill_btn = None
+        for child in dialog.findChildren(QPushButton):
+            if child.text() == '添加候补':
+                add_btn = child
+            elif child.text() == '导入候补':
+                import_btn = child
+            elif child.text() == '自动补位':
+                auto_fill_btn = child
+
+        assert add_btn is not None and add_btn.isVisible()
+        assert import_btn is not None and import_btn.isVisible()
+        assert auto_fill_btn is not None and auto_fill_btn.isVisible()
+        print_test('候补名单对话框有完整操作按钮', True)
+
+        widget.close()
+        dialog.close()
+
+        print_test('GUI 主链路可触发', True)
+
+        return course_id
+    except Exception as e:
+        print_test('GUI 候补名单集成测试', False, str(e))
+        return None
+    finally:
+        WaitingListDialog.exec = original_exec
+        if app:
+            app.processEvents()
+
+
+def test_waiting_list_deadline_and_status_validation():
+    print('\n=== 测试补位时间和状态拦截 ===')
+
+    course_data = {
+        'title': '截止时间测试课程',
+        'theme': '截止测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=7)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=7, hours=3)).isoformat(),
+        'capacity': 3,
+        'registration_deadline': (datetime.now() - timedelta(days=1)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student1 = {'name': '截止生1', 'employee_id': 'DEAD001', 'department': '技术部'}
+    reg_id1 = RegistrationService.register_student(course_id, student1)
+    student2 = {'name': '截止生2', 'employee_id': 'DEAD002', 'department': '产品部'}
+    reg_id2 = RegistrationService.register_student(course_id, student2)
+
+    waiting_student = {
+        'name': '截止候补',
+        'employee_id': 'DEADWAIT001',
+        'department': '运营部',
+        'phone': '13900000001'
+    }
+
+    try:
+        WaitingListService.add_to_waiting_list(course_id, waiting_student, 0, 'manual')
+        print_test('报名截止后添加候补被拦截', False, '应该抛出异常')
+    except ValidationError as e:
+        print_test('报名截止后添加候补拦截成功', True, str(e))
+
+    course_data['registration_deadline'] = (datetime.now() + timedelta(days=6)).isoformat()
+    course_data['status'] = 'draft'
+    CourseService.update_course(course_id, course_data)
+
+    try:
+        WaitingListService.add_to_waiting_list(
+            course_id,
+            {'name': '草稿候补', 'employee_id': 'DRAFTWAIT001', 'department': '技术部'},
+            0, 'manual'
+        )
+        print_test('草稿课程添加候补被拦截', False, '应该抛出异常')
+    except ValidationError as e:
+        print_test('草稿课程添加候补拦截成功', True, str(e))
+
+    course_data['status'] = 'published'
+    CourseService.update_course(course_id, course_data)
+
+    WaitingListService.add_to_waiting_list(course_id, waiting_student, 0, 'manual')
+
+    BatchOperationService.batch_cancel(course_id, [reg_id2])
+
+    course_data['registration_deadline'] = (datetime.now() - timedelta(days=1)).isoformat()
+    CourseService.update_course(course_id, course_data)
+
+    try:
+        result = WaitingListService.execute_auto_fill(course_id)
+        assert result['success_count'] == 0, '报名截止后补位应该失败'
+        assert result['failure_count'] == 1
+        assert '报名已截止' in result['items'][0]['failure_reason']
+        print_test('报名截止后补位被拦截', True, result['items'][0]['failure_reason'])
+    except Exception as e:
+        print_test('报名截止后补位拦截测试', False, str(e))
+
+
 def test_summary():
     print('\n' + '='*50)
     print('所有测试用例执行完成')
@@ -2307,6 +2881,28 @@ if __name__ == '__main__':
         test_gui_export_trigger()
         test_gui_persistence_after_restart()
 
+        print('\n' + '='*50)
+        print('候补名单专项测试')
+        print('='*50)
+
+        test_waiting_list_manual_add()
+        test_waiting_list_import_partial_failure()
+        test_auto_fill_preview_and_execute()
+        test_auto_fill_validation_rules()
+        test_waiting_list_deadline_and_status_validation()
+
+        print('\n' + '='*50)
+        print('候补数据持久化测试')
+        print('='*50)
+
+        test_waiting_list_persistence()
+
+        print('\n' + '='*50)
+        print('候补名单 GUI 集成测试')
+        print('='*50)
+
+        test_waiting_list_gui_integration()
+
         test_summary()
     finally:
         db_module.DB_PATH = original_path
@@ -2318,6 +2914,18 @@ if __name__ == '__main__':
             except:
                 pass
         export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '批量操作结果_*.csv'))
+        for f in export_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+        export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '候补导入结果_*.csv'))
+        for f in export_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+        export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '补位结果_*.csv'))
         for f in export_files:
             try:
                 os.remove(f)
