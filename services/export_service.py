@@ -101,7 +101,11 @@ class ExportService:
             'makeup_approved': '补签审核通过',
             'makeup_rejected': '补签审核驳回',
             'import_validation_error': '批量导入校验失败',
-            'import_system_error': '批量导入系统异常'
+            'import_system_error': '批量导入系统异常',
+            'certificate_issued': '结业证书生成',
+            'certificate_reissued': '结业证书补发',
+            'certificate_voided': '结业证书作废',
+            'certificate_generation_failed': '结业证书生成失败'
         }
 
         with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
@@ -449,6 +453,105 @@ class ExportService:
                     '成功' if row.get('result') == 'success' else '失败',
                     row.get('failure_reason', ''),
                     row.get('registration_id', '')
+                ])
+
+        return output_path
+
+    @staticmethod
+    def export_certificates(certificates=None, output_path=None):
+        if certificates is None:
+            from services import CertificateService
+            certificates = CertificateService.get_all_certificates()
+
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'exports'
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(
+                output_dir,
+                f'结业证书列表_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            )
+
+        status_map = {
+            'issued': '已发放',
+            'voided': '已作废'
+        }
+
+        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+
+            writer.writerow(['结业证书列表'])
+            writer.writerow(['导出时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            writer.writerow([])
+
+            writer.writerow([
+                '编号', '证书编号', '学员姓名', '学员工号', '部门',
+                '课程名称', '课程主题', '状态',
+                '发放日期', '生成时间', '作废时间',
+                '作废原因', '备注', '操作人'
+            ])
+
+            for idx, cert in enumerate(certificates, 1):
+                writer.writerow([
+                    idx,
+                    cert.get('certificate_no', ''),
+                    cert.get('student_name', ''),
+                    cert.get('employee_id', ''),
+                    cert.get('department', ''),
+                    cert.get('course_title', ''),
+                    cert.get('course_theme', ''),
+                    status_map.get(cert.get('status', ''), cert.get('status', '')),
+                    cert.get('issue_date', ''),
+                    cert.get('generated_at', ''),
+                    cert.get('voided_at', ''),
+                    cert.get('void_reason', ''),
+                    cert.get('remark', ''),
+                    cert.get('operated_by', '')
+                ])
+
+        return output_path
+
+    @staticmethod
+    def export_certificate_batch_result(batch_result, output_path=None):
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'exports'
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            safe_title = batch_result.get('course_title', '').replace('/', '_').replace('\\', '_')
+            output_path = os.path.join(
+                output_dir,
+                f'批量生成结业证书结果_{safe_title}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            )
+
+        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+
+            writer.writerow(['批量生成结业证书结果'])
+            writer.writerow(['操作时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            writer.writerow(['课程名称', batch_result.get('course_title', '')])
+            writer.writerow(['处理总数', batch_result.get('total_count', 0)])
+            writer.writerow(['成功数', batch_result.get('success_count', 0)])
+            writer.writerow(['失败数', batch_result.get('failure_count', 0)])
+            writer.writerow([])
+
+            writer.writerow([
+                '序号', '证书编号', '学员姓名', '学员工号',
+                '处理结果', '失败原因', '操作时间'
+            ])
+
+            for idx, item in enumerate(batch_result.get('items', []), 1):
+                writer.writerow([
+                    idx,
+                    item.get('certificate_no', ''),
+                    item.get('student_name', ''),
+                    item.get('employee_id', ''),
+                    '成功' if item.get('success') else '失败',
+                    item.get('failure_reason', ''),
+                    item.get('created_at', '')
                 ])
 
         return output_path

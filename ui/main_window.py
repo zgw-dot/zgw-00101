@@ -10,7 +10,7 @@ from services import ExceptionService, UndoManager
 from .widgets import (
     CourseCalendarWidget, CourseListWidget, CourseDetailWidget,
     TransferReviewWidget, MakeupReviewWidget, ExceptionLogWidget,
-    HistoryWidget
+    HistoryWidget, CertificateManagementWidget
 )
 from .dialogs import UndoDialog
 
@@ -102,6 +102,7 @@ class MainWindow(QMainWindow):
             ('📚 课程管理', 'courses'),
             ('🔄 调课审核', 'transfer'),
             ('✍️ 补签审核', 'makeup'),
+            ('🎓 结业证书', 'certificate'),
             ('⚠️ 异常日志', 'exception'),
             ('📊 历史记录', 'history')
         ]
@@ -121,6 +122,7 @@ class MainWindow(QMainWindow):
         self.course_list_widget = CourseListWidget()
         self.transfer_widget = TransferReviewWidget()
         self.makeup_widget = MakeupReviewWidget()
+        self.certificate_widget = CertificateManagementWidget()
         self.exception_widget = ExceptionLogWidget()
         self.history_widget = HistoryWidget()
 
@@ -128,6 +130,7 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(self.course_list_widget)
         self.content_stack.addWidget(self.transfer_widget)
         self.content_stack.addWidget(self.makeup_widget)
+        self.content_stack.addWidget(self.certificate_widget)
         self.content_stack.addWidget(self.exception_widget)
         self.content_stack.addWidget(self.history_widget)
 
@@ -160,8 +163,9 @@ class MainWindow(QMainWindow):
             'courses': 1,
             'transfer': 2,
             'makeup': 3,
-            'exception': 4,
-            'history': 5
+            'certificate': 4,
+            'exception': 5,
+            'history': 6
         }
 
         if key in mapping:
@@ -284,6 +288,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.makeup_widget.refresh()
+        except:
+            pass
+        try:
+            self.certificate_widget.refresh_certificates()
         except:
             pass
         try:

@@ -974,3 +974,272 @@ class WaitingListResultDAO:
         rows = cursor.fetchall()
         conn.close()
         return rows_to_dict_list(rows)
+
+
+class CertificateDAO:
+    @staticmethod
+    def generate_certificate_no(course_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT title, start_time FROM courses WHERE id=?', (course_id,))
+        course = cursor.fetchone()
+        conn.close()
+
+        if not course:
+            return None
+
+        title = course['title']
+        start_time = course['start_time']
+        year = start_time[:4]
+        title_short = ''.join([c for c in title if c.isalnum()])[:8].upper()
+
+        import random
+        random_part = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+        return f'CERT-{year}-{title_short}-{random_part}'
+
+    @staticmethod
+    def create(course_id, student_id, registration_id=None, status='issued', remark='', operated_by='管理员'):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            certificate_no = None
+            for _ in range(5):
+                candidate = CertificateDAO.generate_certificate_no(course_id)
+                cursor.execute('SELECT id FROM certificates WHERE certificate_no=?', (candidate,))
+                if not cursor.fetchone():
+                    certificate_no = candidate
+                    break
+
+            if not certificate_no:
+                raise Exception('无法生成唯一证书编号')
+
+            issue_date = now[:10]
+            cursor.execute('''
+            INSERT INTO certificates (
+                certificate_no, course_id, student_id, registration_id,
+                status, issue_date, generated_at, remark, operated_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (certificate_no, course_id, student_id, registration_id,
+                  status, issue_date, now, remark, operated_by))
+            conn.commit()
+            cert_id = cursor.lastrowid
+            cursor.execute('SELECT * FROM certificates WHERE id=?', (cert_id,))
+            row = cursor.fetchone()
+            return row_to_dict(row)
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_by_id(cert_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT c.*, co.title as course_title, co.theme as course_theme,
+               co.start_time as course_start, co.end_time as course_end,
+               s.name as student_name, s.employee_id, s.department
+        FROM certificates c
+        JOIN courses co ON c.course_id = co.id
+        JOIN students s ON c.student_id = s.id
+        WHERE c.id=?
+        ''', (cert_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row_to_dict(row)
+
+    @staticmethod
+    def get_by_certificate_no(certificate_no):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT c.*, co.title as course_title, co.theme as course_theme,
+               co.start_time as course_start, co.end_time as course_end,
+               s.name as student_name, s.employee_id, s.department
+        FROM certificates c
+        JOIN courses co ON c.course_id = co.id
+        JOIN students s ON c.student_id = s.id
+        WHERE c.certificate_no=?
+        ''', (certificate_no,))
+        row = cursor.fetchone()
+        conn.close()
+        return row_to_dict(row)
+
+    @staticmethod
+    def get_by_course_and_student(course_id, student_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT c.*, co.title as course_title, s.name as student_name, s.employee_id
+        FROM certificates c
+        JOIN courses co ON c.course_id = co.id
+        JOIN students s ON c.student_id = s.id
+        WHERE c.course_id=? AND c.student_id=?
+        ORDER BY c.generated_at DESC
+        ''', (course_id, student_id))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+    @staticmethod
+    def get_all(course_id=None, student_id=None, status=None):
+        conn = get_connection()
+        cursor = conn.cursor()
+        query = '''
+        SELECT c.*, co.title as course_title, co.theme as course_theme,
+               co.start_time as course_start, co.end_time as course_end,
+               s.name as student_name, s.employee_id, s.department
+        FROM certificates c
+        JOIN courses co ON c.course_id = co.id
+        JOIN students s ON c.student_id = s.id
+        '''
+        conditions = []
+        params = []
+        if course_id:
+            conditions.append('c.course_id=?')
+            params.append(course_id)
+        if student_id:
+            conditions.append('c.student_id=?')
+            params.append(student_id)
+        if status:
+            conditions.append('c.status=?')
+            params.append(status)
+        if conditions:
+            query += ' WHERE ' + ' AND '.join(conditions)
+        query += ' ORDER BY c.generated_at DESC'
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+    @staticmethod
+    def void_certificate(cert_id, void_reason, operated_by='管理员'):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+            UPDATE certificates
+            SET status='voided', voided_at=?, void_reason=?, operated_by=?
+            WHERE id=? AND status='issued'
+            ''', (now, void_reason, operated_by, cert_id))
+            conn.commit()
+            updated = cursor.rowcount > 0
+            return updated
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+
+    @staticmethod
+    def exists_active(course_id, student_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT id FROM certificates
+        WHERE course_id=? AND student_id=? AND status='issued'
+        ''', (course_id, student_id))
+        row = cursor.fetchone()
+        conn.close()
+        return row is not None
+
+
+class CertificateBatchLogDAO:
+    @staticmethod
+    def create(course_id, operation_type, total_count=0, success_count=0,
+               failure_count=0, operated_by='管理员'):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT INTO certificate_batch_logs (
+            course_id, operation_type, total_count, success_count,
+            failure_count, operated_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (course_id, operation_type, total_count, success_count,
+              failure_count, operated_by, now))
+        conn.commit()
+        log_id = cursor.lastrowid
+        conn.close()
+        return log_id
+
+    @staticmethod
+    def update_counts(log_id, success_count, failure_count):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        UPDATE certificate_batch_logs
+        SET success_count=?, failure_count=?
+        WHERE id=?
+        ''', (success_count, failure_count, log_id))
+        conn.commit()
+        conn.close()
+        return cursor.rowcount > 0
+
+    @staticmethod
+    def get_by_id(log_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT bl.*, c.title as course_title
+        FROM certificate_batch_logs bl
+        JOIN courses c ON bl.course_id = c.id
+        WHERE bl.id=?
+        ''', (log_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row_to_dict(row)
+
+    @staticmethod
+    def get_all():
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT bl.*, c.title as course_title
+        FROM certificate_batch_logs bl
+        JOIN courses c ON bl.course_id = c.id
+        ORDER BY bl.created_at DESC
+        ''')
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
+
+class CertificateBatchItemDAO:
+    @staticmethod
+    def create(batch_log_id, student_id, success, certificate_id=None,
+               failure_reason=None):
+        now = datetime.now().isoformat()
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT INTO certificate_batch_items (
+            batch_log_id, student_id, certificate_id, success,
+            failure_reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ''', (batch_log_id, student_id, certificate_id, 1 if success else 0,
+              failure_reason, now))
+        conn.commit()
+        item_id = cursor.lastrowid
+        conn.close()
+        return item_id
+
+    @staticmethod
+    def get_by_batch_log(batch_log_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT bi.*, s.name as student_name, s.employee_id,
+               c.certificate_no
+        FROM certificate_batch_items bi
+        JOIN students s ON bi.student_id = s.id
+        LEFT JOIN certificates c ON bi.certificate_id = c.id
+        WHERE bi.batch_log_id=?
+        ORDER BY bi.id
+        ''', (batch_log_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)

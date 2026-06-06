@@ -11,7 +11,8 @@ from datetime import datetime, timedelta
 from services import (
     CourseService, RegistrationService, AttendanceService,
     ExportService, ExceptionService, BatchOperationService,
-    UndoManager, WaitingListService, ValidationError
+    UndoManager, WaitingListService, CertificateService,
+    ValidationError
 )
 from .dialogs import (
     CourseDialog, RegistrationDialog, TransferDialog,
@@ -20,7 +21,10 @@ from .dialogs import (
     BatchOperationConfirmDialog, BatchOperationResultDialog,
     BatchTargetCourseDialog, BatchTargetStatusDialog,
     WaitingListDialog, AddToWaitingListDialog, WaitingImportResultDialog,
-    AutoFillPreviewDialog, AutoFillResultDialog
+    AutoFillPreviewDialog, AutoFillResultDialog,
+    CertificatePreviewDialog, CertificateBatchResultDialog,
+    CertificateVoidDialog, CertificateReissueDialog,
+    CertificateSelectCourseDialog
 )
 
 class CourseCalendarWidget(QWidget):
@@ -1112,3 +1116,355 @@ class HistoryWidget(QWidget):
         course_id = self.table.item(index.row(), 0).data(Qt.UserRole)
         if course_id:
             self.window().open_course_detail(course_id)
+
+
+class CertificateManagementWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_course_id = None
+        self.init_ui()
+        self.load_courses()
+        self.refresh_certificates()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        toolbar = QHBoxLayout()
+
+        course_label = QLabel('选择课程：')
+        toolbar.addWidget(course_label)
+
+        self.course_combo = QComboBox()
+        self.course_combo.setMinimumWidth(300)
+        self.course_combo.currentIndexChanged.connect(self.on_course_changed)
+        toolbar.addWidget(self.course_combo)
+
+        toolbar.addSpacing(20)
+
+        select_course_btn = QPushButton('🔍 选择课程')
+        select_course_btn.setStyleSheet('background: #2196f3; color: white; padding: 6px 16px;')
+        select_course_btn.clicked.connect(self.select_course)
+        toolbar.addWidget(select_course_btn)
+
+        generate_btn = QPushButton('📄 批量生成证书')
+        generate_btn.setStyleSheet('background: #4caf50; color: white; padding: 6px 16px;')
+        generate_btn.clicked.connect(self.batch_generate)
+        toolbar.addWidget(generate_btn)
+
+        reissue_btn = QPushButton('🔄 补发证书')
+        reissue_btn.setStyleSheet('background: #ff9800; color: white; padding: 6px 16px;')
+        reissue_btn.clicked.connect(self.reissue_certificate)
+        toolbar.addWidget(reissue_btn)
+
+        toolbar.addStretch()
+
+        status_label = QLabel('状态筛选：')
+        toolbar.addWidget(status_label)
+
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(['全部', '已发放', '已作废'])
+        self.status_combo.currentIndexChanged.connect(self.refresh_certificates)
+        toolbar.addWidget(self.status_combo)
+
+        refresh_btn = QPushButton('刷新')
+        refresh_btn.clicked.connect(self.refresh_certificates)
+        toolbar.addWidget(refresh_btn)
+
+        export_btn = QPushButton('导出CSV')
+        export_btn.setStyleSheet('background: #9c27b0; color: white; padding: 6px 16px;')
+        export_btn.clicked.connect(self.export_certificates)
+        toolbar.addWidget(export_btn)
+
+        layout.addLayout(toolbar)
+
+        self.info_frame = QFrame()
+        self.info_frame.setStyleSheet('background: #f5f5f5; border-radius: 6px; padding: 10px;')
+        self.info_layout = QHBoxLayout(self.info_frame)
+
+        self.total_label = QLabel('证书总数：0')
+        self.info_layout.addWidget(self.total_label)
+
+        self.issued_label = QLabel('已发放：0')
+        self.issued_label.setStyleSheet('color: #4caf50; margin-left: 20px;')
+        self.info_layout.addWidget(self.issued_label)
+
+        self.voided_label = QLabel('已作废：0')
+        self.voided_label.setStyleSheet('color: #f44336; margin-left: 20px;')
+        self.info_layout.addWidget(self.voided_label)
+
+        self.info_layout.addStretch()
+
+        layout.addWidget(self.info_frame)
+
+        tabs = QTabWidget()
+
+        self.cert_tab = QWidget()
+        cert_layout = QVBoxLayout(self.cert_tab)
+
+        self.cert_table = QTableWidget()
+        self.cert_table.setColumnCount(10)
+        self.cert_table.setHorizontalHeaderLabels([
+            '证书编号', '学员姓名', '学员工号', '部门',
+            '课程名称', '状态', '发放日期', '生成时间',
+            '作废原因', '操作'
+        ])
+        self.cert_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.cert_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.cert_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        cert_layout.addWidget(self.cert_table)
+
+        tabs.addTab(self.cert_tab, '证书列表')
+
+        self.batch_tab = QWidget()
+        batch_layout = QVBoxLayout(self.batch_tab)
+
+        self.batch_table = QTableWidget()
+        self.batch_table.setColumnCount(7)
+        self.batch_table.setHorizontalHeaderLabels([
+            '批次ID', '课程名称', '操作类型', '处理总数',
+            '成功数', '失败数', '操作时间'
+        ])
+        self.batch_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.batch_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.batch_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.batch_table.doubleClicked.connect(self.show_batch_detail)
+        batch_layout.addWidget(self.batch_table)
+
+        tabs.addTab(self.batch_tab, '批量操作记录')
+
+        layout.addWidget(tabs, 1)
+
+    def load_courses(self):
+        self.course_combo.clear()
+        self.course_combo.addItem('全部课程', None)
+
+        courses = CourseService.get_all_courses()
+        now = datetime.now()
+
+        for course in courses:
+            end_time = datetime.fromisoformat(course['end_time'])
+            ended = now >= end_time
+            suffix = ' (已结束)' if ended else ''
+            self.course_combo.addItem(course['title'] + suffix, course['id'])
+
+    def on_course_changed(self):
+        self.current_course_id = self.course_combo.currentData()
+        self.refresh_certificates()
+
+    def select_course(self):
+        dialog = CertificateSelectCourseDialog(self)
+        if dialog.exec():
+            course_id = dialog.get_selected_course_id()
+            if course_id:
+                index = self.course_combo.findData(course_id)
+                if index >= 0:
+                    self.course_combo.setCurrentIndex(index)
+                self.preview_and_generate(course_id)
+
+    def preview_and_generate(self, course_id):
+        course = CourseService.get_course(course_id)
+        if not course:
+            QMessageBox.warning(self, '错误', '课程不存在')
+            return
+
+        now = datetime.now()
+        end_time = datetime.fromisoformat(course['end_time'])
+        if now < end_time:
+            QMessageBox.warning(self, '提示', '课程尚未结束，不能生成结业证书')
+            return
+
+        preview = CertificatePreviewDialog(course_id, self)
+        if preview.exec():
+            selected_ids = preview.get_selected_student_ids()
+            remark = preview.get_remark()
+
+            if not selected_ids:
+                QMessageBox.information(self, '提示', '未选择任何学员')
+                return
+
+            reply = QMessageBox.question(
+                self, '确认生成',
+                f'确定要为选中的 {len(selected_ids)} 名学员生成结业证书吗？',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply == QMessageBox.Yes:
+                try:
+                    result = CertificateService.batch_generate_certificates(
+                        course_id=course_id,
+                        student_ids=selected_ids,
+                        remark=remark
+                    )
+                    self.refresh_certificates()
+                    self.refresh_batch_logs()
+
+                    result_dialog = CertificateBatchResultDialog(result, self)
+                    result_dialog.exec()
+                except ValidationError as e:
+                    QMessageBox.warning(self, '生成失败', str(e))
+                except Exception as e:
+                    QMessageBox.warning(self, '系统错误', f'生成过程中发生错误：{e}')
+
+    def batch_generate(self):
+        if self.current_course_id:
+            self.preview_and_generate(self.current_course_id)
+        else:
+            self.select_course()
+
+    def reissue_certificate(self):
+        current_row = self.cert_table.currentRow()
+        if current_row < 0:
+            QMessageBox.information(self, '提示', '请先选择要补发的证书记录')
+            return
+
+        cert = self.cert_table.item(current_row, 0).data(Qt.UserRole)
+        if not cert:
+            return
+
+        dialog = CertificateReissueDialog(cert['course_id'], cert['student_id'], self)
+        if dialog.exec():
+            remark = dialog.get_remark()
+            try:
+                new_cert = CertificateService.reissue_certificate(
+                    course_id=cert['course_id'],
+                    student_id=cert['student_id'],
+                    remark=remark
+                )
+                QMessageBox.information(
+                    self, '补发成功',
+                    f'证书补发成功！\n新证书编号：{new_cert["certificate_no"]}'
+                )
+                self.refresh_certificates()
+            except ValidationError as e:
+                QMessageBox.warning(self, '补发失败', str(e))
+            except Exception as e:
+                QMessageBox.warning(self, '系统错误', f'补发过程中发生错误：{e}')
+
+    def void_certificate(self, cert):
+        dialog = CertificateVoidDialog(cert, self)
+        if dialog.exec():
+            void_reason = dialog.get_void_reason()
+            try:
+                CertificateService.void_certificate(cert['id'], void_reason)
+                QMessageBox.information(self, '作废成功', '证书已作废')
+                self.refresh_certificates()
+            except ValidationError as e:
+                QMessageBox.warning(self, '作废失败', str(e))
+            except Exception as e:
+                QMessageBox.warning(self, '系统错误', f'作废过程中发生错误：{e}')
+
+    def refresh_certificates(self):
+        status_filter = self.status_combo.currentText()
+        status_map = {'全部': None, '已发放': 'issued', '已作废': 'voided'}
+        status = status_map.get(status_filter)
+
+        certificates = CertificateService.get_all_certificates(
+            course_id=self.current_course_id,
+            status=status
+        )
+
+        self.cert_table.setRowCount(len(certificates))
+
+        status_display = {'issued': '已发放', 'voided': '已作废'}
+
+        issued_count = 0
+        voided_count = 0
+
+        for row, cert in enumerate(certificates):
+            self.cert_table.setItem(row, 0, QTableWidgetItem(cert['certificate_no']))
+            self.cert_table.setItem(row, 1, QTableWidgetItem(cert['student_name']))
+            self.cert_table.setItem(row, 2, QTableWidgetItem(cert['employee_id']))
+            self.cert_table.setItem(row, 3, QTableWidgetItem(cert.get('department', '')))
+            self.cert_table.setItem(row, 4, QTableWidgetItem(cert['course_title']))
+
+            status_text = status_display.get(cert['status'], cert['status'])
+            status_item = QTableWidgetItem(status_text)
+            if cert['status'] == 'issued':
+                status_item.setForeground(QBrush(QColor(76, 175, 80)))
+            else:
+                status_item.setForeground(QBrush(QColor(244, 67, 54)))
+            self.cert_table.setItem(row, 5, status_item)
+
+            self.cert_table.setItem(row, 6, QTableWidgetItem(cert['issue_date']))
+            self.cert_table.setItem(row, 7, QTableWidgetItem(cert['generated_at'][:19]))
+            self.cert_table.setItem(row, 8, QTableWidgetItem(cert.get('void_reason', '')))
+
+            btn_widget = QWidget()
+            btn_layout = QHBoxLayout(btn_widget)
+            btn_layout.setContentsMargins(2, 2, 2, 2)
+
+            if cert['status'] == 'issued':
+                void_btn = QPushButton('作废')
+                void_btn.setFixedHeight(24)
+                void_btn.setStyleSheet('background: #f44336; color: white; padding: 2px 10px;')
+                void_btn.clicked.connect(lambda _, c=cert: self.void_certificate(c))
+                btn_layout.addWidget(void_btn)
+
+            self.cert_table.setCellWidget(row, 9, btn_widget)
+
+            self.cert_table.item(row, 0).setData(Qt.UserRole, cert)
+
+            if cert['status'] == 'issued':
+                issued_count += 1
+            else:
+                voided_count += 1
+
+        self.total_label.setText(f'证书总数：{len(certificates)}')
+        self.issued_label.setText(f'已发放：{issued_count}')
+        self.voided_label.setText(f'已作废：{voided_count}')
+
+        self.refresh_batch_logs()
+
+    def refresh_batch_logs(self):
+        batch_logs = CertificateService.get_all_batch_logs()
+        self.batch_table.setRowCount(len(batch_logs))
+
+        for row, log in enumerate(batch_logs):
+            self.batch_table.setItem(row, 0, QTableWidgetItem(str(log['id'])))
+            self.batch_table.setItem(row, 1, QTableWidgetItem(log.get('course_title', '')))
+            self.batch_table.setItem(row, 2, QTableWidgetItem('批量生成'))
+            self.batch_table.setItem(row, 3, QTableWidgetItem(str(log['total_count'])))
+            self.batch_table.setItem(row, 4, QTableWidgetItem(str(log['success_count'])))
+            self.batch_table.setItem(row, 5, QTableWidgetItem(str(log['failure_count'])))
+            self.batch_table.setItem(row, 6, QTableWidgetItem(log['created_at'][:19]))
+
+            self.batch_table.item(row, 0).setData(Qt.UserRole, log['id'])
+
+    def show_batch_detail(self, index):
+        batch_log_id = self.batch_table.item(index.row(), 0).data(Qt.UserRole)
+        if batch_log_id:
+            try:
+                batch_log = CertificateService.get_batch_log(batch_log_id)
+                items = CertificateService.get_batch_items(batch_log_id)
+
+                result = {
+                    'batch_log_id': batch_log_id,
+                    'course_id': batch_log['course_id'],
+                    'course_title': batch_log.get('course_title', ''),
+                    'total_count': batch_log['total_count'],
+                    'success_count': batch_log['success_count'],
+                    'failure_count': batch_log['failure_count'],
+                    'items': items
+                }
+
+                dialog = CertificateBatchResultDialog(result, self)
+                dialog.exec()
+            except Exception as e:
+                QMessageBox.warning(self, '错误', f'加载批量记录详情失败：{e}')
+
+    def export_certificates(self):
+        try:
+            status_filter = self.status_combo.currentText()
+            status_map = {'全部': None, '已发放': 'issued', '已作废': 'voided'}
+            status = status_map.get(status_filter)
+
+            certificates = CertificateService.get_all_certificates(
+                course_id=self.current_course_id,
+                status=status
+            )
+
+            path = ExportService.export_certificates(certificates)
+            QMessageBox.information(self, '导出成功', f'证书列表已导出到：\n{path}')
+        except Exception as e:
+            QMessageBox.warning(self, '导出失败', str(e))

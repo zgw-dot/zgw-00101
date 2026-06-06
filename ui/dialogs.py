@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QBrush
 from services import (
     CourseService, RegistrationService, AttendanceService,
     ExportService, BatchOperationService, UndoManager, WaitingListService,
-    ValidationError
+    CertificateService, ValidationError
 )
 from datetime import datetime, timedelta
 
@@ -1809,3 +1809,536 @@ class AutoFillResultDialog(QDialog):
             QMessageBox.information(self, '导出成功', f'补位结果已导出到：\n{path}')
         except Exception as e:
             QMessageBox.warning(self, '导出失败', str(e))
+
+
+class CertificatePreviewDialog(QDialog):
+    def __init__(self, course_id, parent=None):
+        super().__init__(parent)
+        self.course_id = course_id
+        self.preview_data = None
+        self.setWindowTitle('结业证书生成预览')
+        self.resize(900, 650)
+        self.init_ui()
+        self.load_preview()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        title_label = QLabel('结业证书生成预览')
+        title_label.setStyleSheet('font-size: 18px; font-weight: bold;')
+        layout.addWidget(title_label)
+
+        self.summary_frame = QFrame()
+        self.summary_frame.setStyleSheet('background: #f5f5f5; border-radius: 8px; padding: 15px;')
+        self.summary_layout = QVBoxLayout(self.summary_frame)
+        layout.addWidget(self.summary_frame)
+
+        tabs = QTabWidget()
+
+        self.eligible_tab = QWidget()
+        eligible_layout = QVBoxLayout(self.eligible_tab)
+
+        eligible_title = QLabel('符合条件学员（将生成证书）')
+        eligible_title.setStyleSheet('font-size: 14px; font-weight: bold; color: #4caf50;')
+        eligible_layout.addWidget(eligible_title)
+
+        self.eligible_table = QTableWidget()
+        self.eligible_table.setColumnCount(6)
+        self.eligible_table.setHorizontalHeaderLabels([
+            '选择', '姓名', '工号', '部门', '出勤状态', '签到时间'
+        ])
+        self.eligible_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.eligible_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.eligible_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        eligible_layout.addWidget(self.eligible_table)
+
+        self.eligible_checkbox = QCheckBox('全选/取消全选')
+        self.eligible_checkbox.setChecked(True)
+        self.eligible_checkbox.stateChanged.connect(self.toggle_eligible_all)
+        eligible_layout.addWidget(self.eligible_checkbox)
+
+        tabs.addTab(self.eligible_tab, '符合条件')
+
+        self.ineligible_tab = QWidget()
+        ineligible_layout = QVBoxLayout(self.ineligible_tab)
+
+        ineligible_title = QLabel('不符合条件学员（将被拦截）')
+        ineligible_title.setStyleSheet('font-size: 14px; font-weight: bold; color: #f44336;')
+        ineligible_layout.addWidget(ineligible_title)
+
+        self.ineligible_table = QTableWidget()
+        self.ineligible_table.setColumnCount(5)
+        self.ineligible_table.setHorizontalHeaderLabels([
+            '姓名', '工号', '部门', '报名状态', '拦截原因'
+        ])
+        self.ineligible_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ineligible_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.ineligible_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        ineligible_layout.addWidget(self.ineligible_table)
+
+        tabs.addTab(self.ineligible_tab, '不符合条件')
+
+        layout.addWidget(tabs, 1)
+
+        remark_label = QLabel('备注（可选）：')
+        layout.addWidget(remark_label)
+        self.remark_edit = QTextEdit()
+        self.remark_edit.setFixedHeight(60)
+        self.remark_edit.setPlaceholderText('输入备注信息...')
+        layout.addWidget(self.remark_edit)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        cancel_btn = QPushButton('取消')
+        cancel_btn.setStyleSheet('padding: 8px 20px;')
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        self.confirm_btn = QPushButton('确认生成')
+        self.confirm_btn.setStyleSheet('background: #4caf50; color: white; padding: 8px 20px;')
+        self.confirm_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(self.confirm_btn)
+
+        layout.addLayout(btn_layout)
+
+    def load_preview(self):
+        try:
+            self.preview_data = CertificateService.preview_generation(self.course_id)
+
+            course = CourseService.get_course(self.course_id)
+
+            for i in reversed(range(self.summary_layout.count())):
+                self.summary_layout.itemAt(i).widget().setParent(None)
+
+            course_label = QLabel(f'课程：{self.preview_data["course_title"]}')
+            course_label.setStyleSheet('font-size: 16px; font-weight: bold;')
+            self.summary_layout.addWidget(course_label)
+
+            stats_layout = QHBoxLayout()
+            total_label = QLabel(f'总报名人数：<b>{self.preview_data["total_registered"]}</b>')
+            stats_layout.addWidget(total_label)
+
+            eligible_label = QLabel(f'符合条件：<b><span style="color: #4caf50;">{self.preview_data["eligible_count"]}</span></b>')
+            stats_layout.addWidget(eligible_label)
+
+            ineligible_label = QLabel(f'不符合条件：<b><span style="color: #f44336;">{self.preview_data["ineligible_count"]}</span></b>')
+            stats_layout.addWidget(ineligible_label)
+
+            if not self.preview_data['course_ended']:
+                warning_label = QLabel(f'⚠️ {self.preview_data.get("ineligible_reason", "课程尚未结束")}')
+                warning_label.setStyleSheet('color: #ff9800; font-weight: bold;')
+                stats_layout.addWidget(warning_label)
+                self.confirm_btn.setEnabled(False)
+
+            stats_layout.addStretch()
+            self.summary_layout.addLayout(stats_layout)
+
+            eligible_students = self.preview_data['eligible_students']
+            self.eligible_table.setRowCount(len(eligible_students))
+            for row_idx, student in enumerate(eligible_students):
+                checkbox = QCheckBox()
+                checkbox.setChecked(True)
+                checkbox_widget = QWidget()
+                checkbox_layout = QHBoxLayout(checkbox_widget)
+                checkbox_layout.addWidget(checkbox)
+                checkbox_layout.setAlignment(Qt.AlignCenter)
+                checkbox_layout.setContentsMargins(0, 0, 0, 0)
+                self.eligible_table.setCellWidget(row_idx, 0, checkbox_widget)
+
+                self.eligible_table.setItem(row_idx, 1, QTableWidgetItem(student['name']))
+                self.eligible_table.setItem(row_idx, 2, QTableWidgetItem(student['employee_id']))
+                self.eligible_table.setItem(row_idx, 3, QTableWidgetItem(student.get('department', '')))
+                self.eligible_table.setItem(row_idx, 4, QTableWidgetItem('已出勤'))
+                self.eligible_table.setItem(row_idx, 5, QTableWidgetItem(student.get('check_in_time', '')))
+
+                self.eligible_table.item(row_idx, 1).setData(Qt.UserRole, student['student_id'])
+
+            ineligible_students = self.preview_data['ineligible_students']
+            self.ineligible_table.setRowCount(len(ineligible_students))
+            for row_idx, student in enumerate(ineligible_students):
+                self.ineligible_table.setItem(row_idx, 0, QTableWidgetItem(student['name']))
+                self.ineligible_table.setItem(row_idx, 1, QTableWidgetItem(student['employee_id']))
+                self.ineligible_table.setItem(row_idx, 2, QTableWidgetItem(student.get('department', '')))
+
+                status_map = {
+                    'registered': '已报名',
+                    'cancelled': '已取消',
+                    'transferred_out': '已转出'
+                }
+                status = status_map.get(student['registration_status'], student['registration_status'])
+                self.ineligible_table.setItem(row_idx, 3, QTableWidgetItem(status))
+
+                reasons = '；'.join(student.get('failure_reasons', []))
+                reason_item = QTableWidgetItem(reasons)
+                reason_item.setForeground(QBrush(QColor(244, 67, 54)))
+                self.ineligible_table.setItem(row_idx, 4, reason_item)
+
+        except ValidationError as e:
+            QMessageBox.warning(self, '加载失败', str(e))
+            self.reject()
+
+    def toggle_eligible_all(self, state):
+        checked = state == Qt.Checked
+        for row in range(self.eligible_table.rowCount()):
+            cell_widget = self.eligible_table.cellWidget(row, 0)
+            if cell_widget:
+                checkbox = cell_widget.findChild(QCheckBox)
+                if checkbox:
+                    checkbox.setChecked(checked)
+
+    def get_selected_student_ids(self):
+        selected_ids = []
+        for row in range(self.eligible_table.rowCount()):
+            cell_widget = self.eligible_table.cellWidget(row, 0)
+            if cell_widget:
+                checkbox = cell_widget.findChild(QCheckBox)
+                if checkbox and checkbox.isChecked():
+                    student_id = self.eligible_table.item(row, 1).data(Qt.UserRole)
+                    selected_ids.append(student_id)
+        return selected_ids
+
+    def get_remark(self):
+        return self.remark_edit.toPlainText().strip()
+
+
+class CertificateBatchResultDialog(QDialog):
+    def __init__(self, batch_result, parent=None):
+        super().__init__(parent)
+        self.batch_result = batch_result
+        self.setWindowTitle('批量生成结业证书结果')
+        self.resize(900, 600)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet('background: #f5f5f5; border-radius: 8px; padding: 15px;')
+        summary_layout = QVBoxLayout(summary_frame)
+
+        title = QLabel(f'课程：{self.batch_result.get("course_title", "")}')
+        title.setStyleSheet('font-size: 16px; font-weight: bold;')
+        summary_layout.addWidget(title)
+
+        stats_layout = QHBoxLayout()
+        total_label = QLabel(f'处理总数：<b>{self.batch_result.get("total_count", 0)}</b>')
+        total_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(total_label)
+
+        success_count = self.batch_result.get("success_count", 0)
+        success_label = QLabel(f'成功：<b><span style="color: #4caf50;">{success_count}</span></b>')
+        success_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(success_label)
+
+        failure_count = self.batch_result.get("failure_count", 0)
+        failure_label = QLabel(f'失败：<b><span style="color: #f44336;">{failure_count}</span></b>')
+        failure_label.setStyleSheet('font-size: 14px;')
+        stats_layout.addWidget(failure_label)
+
+        stats_layout.addStretch()
+        summary_layout.addLayout(stats_layout)
+        layout.addWidget(summary_frame)
+
+        detail_label = QLabel('处理明细：')
+        detail_label.setStyleSheet('font-size: 14px; font-weight: bold; margin-top: 10px;')
+        layout.addWidget(detail_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            '序号', '证书编号', '姓名', '工号', '处理结果', '失败原因'
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+        items = self.batch_result.get('items', [])
+        self.table.setRowCount(len(items))
+
+        for row_idx, item in enumerate(items):
+            self.table.setItem(row_idx, 0, QTableWidgetItem(str(row_idx + 1)))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(item.get('certificate_no', '')))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(item.get('student_name', '')))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(item.get('employee_id', '')))
+
+            if item.get('success'):
+                result_item = QTableWidgetItem('成功')
+                result_item.setForeground(QBrush(QColor(76, 175, 80)))
+                result_item.setBackground(QBrush(QColor(232, 245, 233)))
+            else:
+                result_item = QTableWidgetItem('失败')
+                result_item.setForeground(QBrush(QColor(244, 67, 54)))
+                result_item.setBackground(QBrush(QColor(255, 235, 238)))
+            self.table.setItem(row_idx, 4, result_item)
+
+            failure_reason = item.get('failure_reason', '')
+            reason_item = QTableWidgetItem(failure_reason)
+            if failure_reason:
+                reason_item.setForeground(QBrush(QColor(244, 67, 54)))
+            self.table.setItem(row_idx, 5, reason_item)
+
+        layout.addWidget(self.table, 1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        export_btn = QPushButton('导出结果')
+        export_btn.setStyleSheet('background: #2196f3; color: white; padding: 8px 20px;')
+        export_btn.clicked.connect(self.export_result)
+        btn_layout.addWidget(export_btn)
+
+        close_btn = QPushButton('关闭')
+        close_btn.setStyleSheet('padding: 8px 20px;')
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+
+    def export_result(self):
+        try:
+            path = ExportService.export_certificate_batch_result(self.batch_result)
+            QMessageBox.information(self, '导出成功', f'结果已导出到：\n{path}')
+        except Exception as e:
+            QMessageBox.warning(self, '导出失败', str(e))
+
+
+class CertificateVoidDialog(QDialog):
+    def __init__(self, certificate, parent=None):
+        super().__init__(parent)
+        self.certificate = certificate
+        self.setWindowTitle('作废结业证书')
+        self.resize(500, 400)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        info_frame = QFrame()
+        info_frame.setStyleSheet('background: #fff3e0; border-radius: 8px; padding: 15px;')
+        info_layout = QVBoxLayout(info_frame)
+
+        title = QLabel('确认作废以下结业证书：')
+        title.setStyleSheet('font-size: 16px; font-weight: bold; color: #e65100;')
+        info_layout.addWidget(title)
+
+        form = QFormLayout()
+        form.addRow('证书编号：', QLabel(self.certificate.get('certificate_no', '')))
+        form.addRow('学员姓名：', QLabel(self.certificate.get('student_name', '')))
+        form.addRow('学员工号：', QLabel(self.certificate.get('employee_id', '')))
+        form.addRow('课程名称：', QLabel(self.certificate.get('course_title', '')))
+        form.addRow('发放日期：', QLabel(self.certificate.get('issue_date', '')))
+        info_layout.addLayout(form)
+
+        layout.addWidget(info_frame)
+
+        warning_label = QLabel('⚠️ 作废后证书状态将变更为"已作废"，此操作不可撤销')
+        warning_label.setStyleSheet('color: #f44336; font-weight: bold; margin-top: 10px;')
+        layout.addWidget(warning_label)
+
+        reason_label = QLabel('作废原因*（至少5个字符）：')
+        reason_label.setStyleSheet('margin-top: 10px;')
+        layout.addWidget(reason_label)
+
+        self.reason_edit = QTextEdit()
+        self.reason_edit.setFixedHeight(100)
+        self.reason_edit.setPlaceholderText('请填写作废原因...')
+        layout.addWidget(self.reason_edit)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        cancel_btn = QPushButton('取消')
+        cancel_btn.setStyleSheet('padding: 8px 20px;')
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        confirm_btn = QPushButton('确认作废')
+        confirm_btn.setStyleSheet('background: #f44336; color: white; padding: 8px 20px;')
+        confirm_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(confirm_btn)
+
+        layout.addLayout(btn_layout)
+
+    def get_void_reason(self):
+        return self.reason_edit.toPlainText().strip()
+
+
+class CertificateReissueDialog(QDialog):
+    def __init__(self, course_id, student_id, parent=None):
+        super().__init__(parent)
+        self.course_id = course_id
+        self.student_id = student_id
+        self.setWindowTitle('补发结业证书')
+        self.resize(500, 350)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        title = QLabel('补发结业证书')
+        title.setStyleSheet('font-size: 18px; font-weight: bold;')
+        layout.addWidget(title)
+
+        course = CourseService.get_course(self.course_id)
+        student = None
+        from db.dao import StudentDAO
+        student = StudentDAO.get_by_id(self.student_id)
+
+        info_frame = QFrame()
+        info_frame.setStyleSheet('background: #e3f2fd; border-radius: 8px; padding: 15px;')
+        info_layout = QFormLayout(info_frame)
+        info_layout.addRow('课程名称：', QLabel(course['title'] if course else ''))
+        info_layout.addRow('学员姓名：', QLabel(student['name'] if student else ''))
+        info_layout.addRow('学员工号：', QLabel(student['employee_id'] if student else ''))
+        layout.addWidget(info_frame)
+
+        existing_certs = CertificateService.get_all_certificates(
+            course_id=self.course_id,
+            student_id=self.student_id
+        )
+        issued_certs = [c for c in existing_certs if c['status'] == 'issued']
+
+        if issued_certs:
+            warning_label = QLabel(
+                f'⚠️ 检测到 {len(issued_certs)} 张有效证书，补发后原证书将自动作废'
+            )
+            warning_label.setStyleSheet('color: #ff9800; font-weight: bold; margin-top: 10px;')
+            layout.addWidget(warning_label)
+
+        remark_label = QLabel('备注（可选）：')
+        remark_label.setStyleSheet('margin-top: 10px;')
+        layout.addWidget(remark_label)
+
+        self.remark_edit = QTextEdit()
+        self.remark_edit.setFixedHeight(80)
+        self.remark_edit.setPlaceholderText('输入备注信息...')
+        layout.addWidget(self.remark_edit)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        cancel_btn = QPushButton('取消')
+        cancel_btn.setStyleSheet('padding: 8px 20px;')
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        confirm_btn = QPushButton('确认补发')
+        confirm_btn.setStyleSheet('background: #2196f3; color: white; padding: 8px 20px;')
+        confirm_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(confirm_btn)
+
+        layout.addLayout(btn_layout)
+
+    def get_remark(self):
+        return self.remark_edit.toPlainText().strip()
+
+
+class CertificateSelectCourseDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('选择课程')
+        self.resize(600, 500)
+        self.init_ui()
+        self.load_courses()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        filter_layout = QHBoxLayout()
+        filter_label = QLabel('筛选：')
+        filter_layout.addWidget(filter_label)
+
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(['全部课程', '已结束课程', '未结束课程'])
+        self.filter_combo.currentIndexChanged.connect(self.load_courses)
+        filter_layout.addWidget(self.filter_combo)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText('搜索课程名称...')
+        self.search_edit.textChanged.connect(self.filter_courses)
+        filter_layout.addWidget(self.search_edit, 1)
+
+        layout.addLayout(filter_layout)
+
+        self.course_table = QTableWidget()
+        self.course_table.setColumnCount(5)
+        self.course_table.setHorizontalHeaderLabels([
+            '课程名称', '主题', '讲师', '结束时间', '状态'
+        ])
+        self.course_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.course_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.course_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.course_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.course_table.doubleClicked.connect(self.accept)
+        layout.addWidget(self.course_table, 1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        cancel_btn = QPushButton('取消')
+        cancel_btn.setStyleSheet('padding: 8px 20px;')
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        ok_btn = QPushButton('确定')
+        ok_btn.setStyleSheet('background: #2196f3; color: white; padding: 8px 20px;')
+        ok_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(ok_btn)
+
+        layout.addLayout(btn_layout)
+
+    def load_courses(self):
+        courses = CourseService.get_all_courses()
+        filter_type = self.filter_combo.currentText()
+        now = datetime.now()
+
+        filtered_courses = []
+        for course in courses:
+            end_time = datetime.fromisoformat(course['end_time'])
+            if filter_type == '已结束课程' and now < end_time:
+                continue
+            if filter_type == '未结束课程' and now >= end_time:
+                continue
+            filtered_courses.append(course)
+
+        self.all_courses = filtered_courses
+        self.display_courses(self.all_courses)
+
+    def filter_courses(self):
+        text = self.search_edit.text().lower().strip()
+        if not text:
+            self.display_courses(self.all_courses)
+            return
+
+        filtered = [c for c in self.all_courses
+                    if text in c['title'].lower() or text in c['theme'].lower()]
+        self.display_courses(filtered)
+
+    def display_courses(self, courses):
+        self.course_table.setRowCount(len(courses))
+        now = datetime.now()
+
+        for row_idx, course in enumerate(courses):
+            self.course_table.setItem(row_idx, 0, QTableWidgetItem(course['title']))
+            self.course_table.setItem(row_idx, 1, QTableWidgetItem(course['theme']))
+            self.course_table.setItem(row_idx, 2, QTableWidgetItem(course['instructor']))
+            self.course_table.setItem(row_idx, 3, QTableWidgetItem(course['end_time']))
+
+            end_time = datetime.fromisoformat(course['end_time'])
+            if now >= end_time:
+                status_item = QTableWidgetItem('已结束')
+                status_item.setForeground(QBrush(QColor(76, 175, 80)))
+            else:
+                status_item = QTableWidgetItem('进行中')
+                status_item.setForeground(QBrush(QColor(255, 152, 0)))
+            self.course_table.setItem(row_idx, 4, status_item)
+
+            self.course_table.item(row_idx, 0).setData(Qt.UserRole, course['id'])
+
+    def get_selected_course_id(self):
+        current_row = self.course_table.currentRow()
+        if current_row >= 0:
+            return self.course_table.item(current_row, 0).data(Qt.UserRole)
+        return None
+

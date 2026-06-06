@@ -9,23 +9,28 @@ from db import init_database
 from services import (
     CourseService, RegistrationService, AttendanceService,
     ExportService, ExceptionService, BatchOperationService,
-    UndoManager, WaitingListService, ValidationError
+    UndoManager, WaitingListService, CertificateService,
+    ValidationError
 )
 from db.dao import (
-    RegistrationDAO, BatchOperationLogDAO, BatchOperationItemDAO,
-    WaitingListDAO, WaitingListResultDAO
+    RegistrationDAO, StudentDAO, BatchOperationLogDAO, BatchOperationItemDAO,
+    WaitingListDAO, WaitingListResultDAO,
+    CertificateDAO, CertificateBatchLogDAO, CertificateBatchItemDAO
 )
 
 try:
-    from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget, QFileDialog, QDialog
+    from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget, QFileDialog, QDialog, QComboBox, QTabWidget, QLabel
     from PySide6.QtCore import Qt
-    from ui.widgets import CourseDetailWidget
+    from ui.widgets import CourseDetailWidget, CertificateManagementWidget
     from ui.dialogs import (
         BatchImportResultDialog, BatchOperationConfirmDialog,
         BatchOperationResultDialog, BatchTargetCourseDialog,
         BatchTargetStatusDialog, UndoDialog, WaitingListDialog,
         AddToWaitingListDialog, WaitingImportResultDialog,
-        AutoFillPreviewDialog, AutoFillResultDialog
+        AutoFillPreviewDialog, AutoFillResultDialog,
+        CertificatePreviewDialog, CertificateBatchResultDialog,
+        CertificateVoidDialog, CertificateReissueDialog,
+        CertificateSelectCourseDialog
     )
     PYSIDE_AVAILABLE = True
 except ImportError:
@@ -2783,6 +2788,515 @@ def test_waiting_list_deadline_and_status_validation():
         print_test('报名截止后补位拦截测试', False, str(e))
 
 
+def test_certificate_preview_generation():
+    print('\n=== 测试结业证书预览生成 ===')
+
+    course_data = {
+        'title': '证书预览测试课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    eligible = {'name': '合格学员', 'employee_id': 'CERT001', 'department': '技术部'}
+    reg_id = RegistrationService.register_student(course_id, eligible)
+    AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+
+    absent = {'name': '缺勤学员', 'employee_id': 'CERT002', 'department': '技术部'}
+    reg_id2 = RegistrationService.register_student(course_id, absent)
+    AttendanceService.record_attendance(course_id, reg_id2, 'absent', None)
+
+    cancelled = {'name': '已取消学员', 'employee_id': 'CERT003', 'department': '技术部'}
+    reg_id3 = RegistrationService.register_student(course_id, cancelled)
+    RegistrationService.cancel_registration(reg_id3, '个人原因')
+
+    not_registered = {'name': '未报名学员', 'employee_id': 'CERT004', 'department': '技术部'}
+    StudentDAO.create(not_registered)
+
+    try:
+        preview = CertificateService.preview_generation(course_id)
+        assert len(preview['eligible']) == 1, f'应该有1个符合条件的学员，实际{len(preview["eligible"])}'
+        assert len(preview['ineligible']) >= 2, f'应该有至少2个不符合条件的学员，实际{len(preview["ineligible"])}'
+        assert preview['eligible'][0]['student']['name'] == '合格学员'
+        print_test('预览筛选逻辑正确', True, f'合格:{len(preview["eligible"])} 不合格:{len(preview["ineligible"])}')
+
+        ineligible_reasons = [item['reason'] for item in preview['ineligible']]
+        assert any('缺勤' in r for r in ineligible_reasons), '应该包含缺勤原因'
+        assert any('取消' in r for r in ineligible_reasons), '应该包含已取消报名原因'
+        print_test('失败原因分类正确', True)
+    except Exception as e:
+        print_test('预览生成测试', False, str(e))
+
+
+def test_certificate_single_issue_and_validation():
+    print('\n=== 测试单个证书生成与校验 ===')
+
+    course_data = {
+        'title': '单证书测试课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student = {'name': '单证书学员', 'employee_id': 'CERT010', 'department': '技术部'}
+    reg_id = RegistrationService.register_student(course_id, student)
+    AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+
+    student_id = StudentDAO.get_by_employee_id('CERT010')['id']
+
+    cert = CertificateService.issue_certificate(course_id, student_id, '测试备注')
+    assert cert is not None, '应该成功生成证书'
+    assert cert['certificate_no'] is not None, '证书编号不能为空'
+    assert cert['status'] == 'issued', '状态应该是已发放'
+    assert cert['certificate_no'].startswith('CERT-'), '证书编号格式不正确'
+    print_test('单个证书生成成功', True, f'编号: {cert["certificate_no"]}')
+
+    try:
+        CertificateService.issue_certificate(course_id, student_id, '重复生成')
+        print_test('重复生成校验', False, '应该抛出异常')
+    except ValidationError as e:
+        assert '已有' in str(e), '错误信息应该包含已有证书'
+        print_test('重复生成拦截成功', True, str(e))
+
+    not_ended_course = {
+        'title': '未结束课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() + timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() + timedelta(days=1, hours=2)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() + timedelta(days=1)).isoformat(),
+        'status': 'published'
+    }
+    not_ended_id = CourseService.create_course(not_ended_course)
+    try:
+        CertificateService.issue_certificate(not_ended_id, student_id)
+        print_test('未结束课程校验', False, '应该抛出异常')
+    except ValidationError as e:
+        assert '未结束' in str(e), '错误信息应该包含未结束'
+        print_test('未结束课程拦截成功', True, str(e))
+
+
+def test_certificate_batch_partial_success_failure():
+    print('\n=== 测试批量生成部分成功部分失败 ===')
+
+    course_data = {
+        'title': '批量证书测试课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student_ids = []
+    for i in range(5):
+        s = {'name': f'批量学员{i+1}', 'employee_id': f'CERTB{i+1:03d}', 'department': '技术部'}
+        reg_id = RegistrationService.register_student(course_id, s)
+        if i < 3:
+            AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+        elif i == 3:
+            AttendanceService.record_attendance(course_id, reg_id, 'absent', None)
+        else:
+            RegistrationService.cancel_registration(reg_id, '个人原因')
+        sid = StudentDAO.get_by_employee_id(f'CERTB{i+1:03d}')['id']
+        student_ids.append(sid)
+
+    result = CertificateService.batch_generate_certificates(course_id, remark='批量测试')
+
+    assert result['total_count'] == 5, f'应该处理5条，实际{result["total_count"]}'
+    assert result['success_count'] == 3, f'应该成功3条，实际{result["success_count"]}'
+    assert result['failure_count'] == 2, f'应该失败2条，实际{result["failure_count"]}'
+    print_test('批量生成统计正确', True, f'总:{result["total_count"]} 成功:{result["success_count"]} 失败:{result["failure_count"]}')
+
+    success_items = [item for item in result['items'] if item['success']]
+    failure_items = [item for item in result['items'] if not item['success']]
+    assert len(success_items) == 3
+    assert len(failure_items) == 2
+
+    failure_reasons = [item['failure_reason'] for item in failure_items]
+    assert any('缺勤' in r for r in failure_reasons), '应该有缺勤失败'
+    assert any('取消' in r for r in failure_reasons), '应该有取消报名失败'
+    print_test('逐条失败原因记录正确', True)
+
+    certs = CertificateDAO.get_all(course_id=course_id)
+    assert len(certs) == 3, f'数据库应该有3张证书，实际{len(certs)}'
+    print_test('证书持久化正确', True)
+
+    batch_logs = CertificateBatchLogDAO.get_all()
+    assert len(batch_logs) >= 1, '应该有批量操作日志'
+    print_test('批量操作日志记录正确', True)
+
+
+def test_certificate_reissue_conflict_avoidance():
+    print('\n=== 测试证书补发与冲突避免 ===')
+
+    course_data = {
+        'title': '补发测试课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student = {'name': '补发学员', 'employee_id': 'CERT020', 'department': '技术部'}
+    reg_id = RegistrationService.register_student(course_id, student)
+    AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+    student_id = StudentDAO.get_by_employee_id('CERT020')['id']
+
+    original_cert = CertificateService.issue_certificate(course_id, student_id, '原始证书')
+    original_no = original_cert['certificate_no']
+    print_test('原始证书生成', True, f'编号: {original_no}')
+
+    reissued_cert = CertificateService.reissue_certificate(course_id, student_id, '补发证书', '测试员')
+    assert reissued_cert is not None, '补发应该成功'
+    assert reissued_cert['certificate_no'] != original_no, '补发应该生成新编号'
+    print_test('补发证书成功', True, f'新编号: {reissued_cert["certificate_no"]}')
+
+    original_updated = CertificateDAO.get_by_id(original_cert['id'])
+    assert original_updated['status'] == 'voided', '原证书应该被作废'
+    assert original_updated['void_reason'] is not None, '应该有作废原因'
+    print_test('原证书自动作废', True)
+
+    active_certs = [c for c in CertificateDAO.get_all(course_id=course_id) if c['status'] == 'issued']
+    assert len(active_certs) == 1, '应该只有1张有效证书'
+    print_test('补发后有效证书唯一', True)
+
+
+def test_certificate_void_with_reason():
+    print('\n=== 测试证书作废与原因校验 ===')
+
+    course_data = {
+        'title': '作废测试课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student = {'name': '作废学员', 'employee_id': 'CERT030', 'department': '技术部'}
+    reg_id = RegistrationService.register_student(course_id, student)
+    AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+    student_id = StudentDAO.get_by_employee_id('CERT030')['id']
+
+    cert = CertificateService.issue_certificate(course_id, student_id)
+
+    try:
+        CertificateService.void_certificate(cert['id'], '短')
+        print_test('作废原因长度校验', False, '应该抛出异常')
+    except ValidationError as e:
+        assert '5' in str(e) or '字符' in str(e), '错误信息应该包含长度要求'
+        print_test('作废原因长度校验通过', True, str(e))
+
+    void_reason = '学员信息有误，申请作废'
+    voided = CertificateService.void_certificate(cert['id'], void_reason, '管理员')
+    assert voided is not None, '作废应该成功'
+    assert voided['status'] == 'voided', '状态应该是已作废'
+    assert voided['void_reason'] == void_reason, '作废原因应该正确记录'
+    assert voided['voided_at'] is not None, '应该有作废时间'
+    print_test('证书作废成功', True, f'原因: {void_reason}')
+
+    try:
+        CertificateService.void_certificate(cert['id'], '再次作废')
+        print_test('重复作废校验', False, '应该抛出异常')
+    except ValidationError as e:
+        assert '作废' in str(e), '错误信息应该包含已作废'
+        print_test('重复作废拦截成功', True, str(e))
+
+
+def test_certificate_cross_restart_persistence():
+    print('\n=== 测试跨重启数据持久化 ===')
+
+    course_data = {
+        'title': '持久化测试课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student = {'name': '持久化学员', 'employee_id': 'CERTP001', 'department': '技术部'}
+    reg_id = RegistrationService.register_student(course_id, student)
+    AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+    student_id = StudentDAO.get_by_employee_id('CERTP001')['id']
+
+    cert = CertificateService.issue_certificate(course_id, student_id, '持久化测试')
+    cert_no = cert['certificate_no']
+    cert_id = cert['id']
+    print_test('初始证书生成', True, f'编号: {cert_no}')
+
+    import importlib
+    import db.database as db_module
+    import db.dao as dao_module
+    import services.certificate_service as cert_service_module
+
+    db_module.get_connection().close()
+
+    importlib.reload(db_module)
+    importlib.reload(dao_module)
+    importlib.reload(cert_service_module)
+
+    from db.database import init_database
+    from db.dao import CertificateDAO
+    from services.certificate_service import CertificateService
+
+    init_database()
+
+    loaded_cert = CertificateDAO.get_by_id(cert_id)
+    assert loaded_cert is not None, '重启后应该能查询到证书'
+    assert loaded_cert['certificate_no'] == cert_no, '证书编号应该一致'
+    assert loaded_cert['status'] == 'issued', '状态应该保持'
+    assert loaded_cert['remark'] == '持久化测试', '备注应该保持'
+    print_test('重启后证书数据一致', True)
+
+    all_certs = CertificateDAO.get_all()
+    assert len(all_certs) >= 1, '重启后证书列表不为空'
+    print_test('重启后证书列表查询正常', True)
+
+    batch_logs = CertificateBatchLogDAO.get_all()
+    assert batch_logs is not None, '重启后批量日志可查询'
+    print_test('重启后批量日志查询正常', True)
+
+
+def test_certificate_export_readability():
+    print('\n=== 测试证书导出内容可读性 ===')
+
+    course_data = {
+        'title': '导出测试课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    for i in range(3):
+        s = {'name': f'导出学员{i+1}', 'employee_id': f'CERTE{i+1:03d}', 'department': '技术部'}
+        reg_id = RegistrationService.register_student(course_id, s)
+        AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+
+    batch_result = CertificateService.batch_generate_certificates(course_id)
+
+    batch_export_path = ExportService.export_certificate_batch_result(batch_result)
+    assert os.path.exists(batch_export_path), '批量结果导出文件应该存在'
+    print_test('批量结果导出成功', True, os.path.basename(batch_export_path))
+
+    with open(batch_export_path, 'r', encoding='utf-8-sig') as f:
+        content = f.read()
+        assert '结业证书批量生成结果' in content, '应该包含标题'
+        assert '课程名称' in content, '应该包含课程名称'
+        assert '处理总数' in content, '应该包含统计信息'
+        assert '成功' in content, '应该包含成功'
+        assert '失败' in content, '应该包含失败'
+        assert '学员姓名' in content, '应该包含学员姓名字段'
+        assert '证书编号' in content, '应该包含证书编号字段'
+        assert '处理结果' in content, '应该包含处理结果字段'
+        assert '失败原因' in content, '应该包含失败原因字段'
+    print_test('批量导出内容可读', True)
+
+    certs = CertificateDAO.get_all(course_id=course_id)
+    cert_export_path = ExportService.export_certificates(certs)
+    assert os.path.exists(cert_export_path), '证书列表导出文件应该存在'
+    print_test('证书列表导出成功', True, os.path.basename(cert_export_path))
+
+    with open(cert_export_path, 'r', encoding='utf-8-sig') as f:
+        content = f.read()
+        assert '结业证书列表' in content, '应该包含标题'
+        assert '导出时间' in content, '应该包含导出时间'
+        assert '学员姓名' in content, '应该包含学员姓名'
+        assert '证书编号' in content, '应该包含证书编号'
+        assert '课程名称' in content, '应该包含课程名称'
+        assert '状态' in content, '应该包含状态'
+        assert '已发放' in content or '已作废' in content, '应该有中文状态'
+    print_test('证书列表导出内容可读', True)
+
+
+def test_certificate_exception_logging():
+    print('\n=== 测试证书异常日志记录 ===')
+
+    course_data = {
+        'title': '异常日志测试课程',
+        'theme': '结业证书',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 5,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    student = {'name': '异常日志学员', 'employee_id': 'CERTL001', 'department': '技术部'}
+    reg_id = RegistrationService.register_student(course_id, student)
+    AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+    student_id = StudentDAO.get_by_employee_id('CERTL001')['id']
+
+    before_logs = ExceptionService.get_all_logs()
+    before_count = len(before_logs) if before_logs else 0
+
+    cert = CertificateService.issue_certificate(course_id, student_id)
+    after_logs = ExceptionService.get_all_logs()
+    after_count = len(after_logs) if after_logs else 0
+    assert after_count > before_count, '生成证书应该记录日志'
+    cert_logs = [l for l in after_logs if '结业证书生成' in (l.get('description') or '')]
+    assert len(cert_logs) >= 1, '应该有证书生成日志'
+    print_test('生成证书日志记录', True)
+
+    voided = CertificateService.void_certificate(cert['id'], '测试作废，需要记录日志')
+    after_void_logs = ExceptionService.get_all_logs()
+    void_logs = [l for l in after_void_logs if '结业证书作废' in (l.get('description') or '')]
+    assert len(void_logs) >= 1, '应该有证书作废日志'
+    print_test('作废证书日志记录', True)
+
+    reissued = CertificateService.reissue_certificate(course_id, student_id, '测试补发')
+    after_reissue_logs = ExceptionService.get_all_logs()
+    reissue_logs = [l for l in after_reissue_logs if '结业证书补发' in (l.get('description') or '')]
+    assert len(reissue_logs) >= 1, '应该有证书补发日志'
+    print_test('补发证书日志记录', True)
+
+    absent_student = {'name': '缺勤日志学员', 'employee_id': 'CERTL002', 'department': '技术部'}
+    reg_id2 = RegistrationService.register_student(course_id, absent_student)
+    AttendanceService.record_attendance(course_id, reg_id2, 'absent', None)
+    absent_id = StudentDAO.get_by_employee_id('CERTL002')['id']
+
+    try:
+        CertificateService.issue_certificate(course_id, absent_id)
+    except:
+        pass
+    after_fail_logs = ExceptionService.get_all_logs()
+    fail_logs = [l for l in after_fail_logs if '结业证书生成失败' in (l.get('type') or '')]
+    assert len(fail_logs) >= 1, '应该有生成失败日志'
+    print_test('生成失败日志记录', True)
+
+
+def test_certificate_gui_main_workflow():
+    print('\n=== 测试 GUI 主链路触发 ===')
+
+    if not PYSIDE_AVAILABLE:
+        print_test('GUI 组件导入', False, 'PySide6 不可用，跳过 GUI 测试')
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    course_data = {
+        'title': 'GUI证书测试课程',
+        'theme': 'GUI测试',
+        'instructor': '测试讲师',
+        'venue': '测试场地',
+        'start_time': (datetime.now() - timedelta(days=1)).isoformat(),
+        'end_time': (datetime.now() - timedelta(days=1, hours=-2)).isoformat(),
+        'capacity': 10,
+        'registration_deadline': (datetime.now() - timedelta(days=2)).isoformat(),
+        'status': 'published'
+    }
+    course_id = CourseService.create_course(course_data)
+
+    for i in range(3):
+        s = {'name': f'GUI学员{i+1}', 'employee_id': f'GUICERT{i+1:03d}', 'department': '技术部'}
+        reg_id = RegistrationService.register_student(course_id, s)
+        if i < 2:
+            AttendanceService.record_attendance(course_id, reg_id, 'present', datetime.now().isoformat())
+        else:
+            AttendanceService.record_attendance(course_id, reg_id, 'absent', None)
+
+    try:
+        widget = CertificateManagementWidget()
+        widget.show()
+        app.processEvents()
+
+        course_combo = widget.findChild(QComboBox)
+        assert course_combo is not None, '应该有课程下拉框'
+        course_items = [course_combo.itemText(i) for i in range(course_combo.count())]
+        assert any('GUI证书测试课程' in item for item in course_items), '下拉框应该包含测试课程'
+        print_test('GUI 课程筛选入口存在', True)
+
+        toolbar_buttons = widget.findChildren(QPushButton)
+        button_texts = [btn.text() for btn in toolbar_buttons]
+        assert any('批量生成' in t for t in button_texts), '应该有批量生成按钮'
+        assert any('补发' in t for t in button_texts), '应该有补发按钮'
+        assert any('导出' in t for t in button_texts), '应该有导出按钮'
+        print_test('GUI 操作按钮完整', True, f'按钮: {button_texts}')
+
+        status_combo = None
+        for child in widget.findChildren(QComboBox):
+            if child != course_combo:
+                status_combo = child
+                break
+        assert status_combo is not None, '应该有状态筛选下拉框'
+        status_items = [status_combo.itemText(i) for i in range(status_combo.count())]
+        assert '全部' in status_items, '状态筛选应该包含全部'
+        assert '已发放' in status_items, '状态筛选应该包含已发放'
+        assert '已作废' in status_items, '状态筛选应该包含已作废'
+        print_test('GUI 状态筛选入口存在', True)
+
+        tab_widget = widget.findChild(QTabWidget)
+        assert tab_widget is not None, '应该有标签页'
+        tab_count = tab_widget.count()
+        assert tab_count >= 2, '应该有至少2个标签页'
+        tab_names = [tab_widget.tabText(i) for i in range(tab_count)]
+        assert '证书列表' in tab_names, '应该有证书列表标签'
+        assert '批量操作记录' in tab_names, '应该有批量操作记录标签'
+        print_test('GUI 标签页完整', True, f'标签: {tab_names}')
+
+        tables = widget.findChildren(QTableWidget)
+        assert len(tables) >= 2, '应该有至少2个表格'
+        print_test('GUI 表格组件存在', True)
+
+        info_labels = widget.findChildren(QLabel)
+        info_texts = [lbl.text() for lbl in info_labels]
+        assert any('证书' in t for t in info_texts), '应该有证书统计信息'
+        print_test('GUI 统计信息展示正常', True)
+
+        widget.refresh_certificates()
+        app.processEvents()
+        print_test('GUI 刷新数据正常', True)
+
+        widget.close()
+        print_test('GUI 主链路可触发', True)
+
+    except Exception as e:
+        print_test('GUI 集成测试', False, str(e))
+        import traceback
+        traceback.print_exc()
+
+
 def test_summary():
     print('\n' + '='*50)
     print('所有测试用例执行完成')
@@ -2903,6 +3417,25 @@ if __name__ == '__main__':
 
         test_waiting_list_gui_integration()
 
+        print('\n' + '='*50)
+        print('结业证书专项测试')
+        print('='*50)
+
+        test_certificate_preview_generation()
+        test_certificate_single_issue_and_validation()
+        test_certificate_batch_partial_success_failure()
+        test_certificate_reissue_conflict_avoidance()
+        test_certificate_void_with_reason()
+        test_certificate_cross_restart_persistence()
+        test_certificate_export_readability()
+        test_certificate_exception_logging()
+
+        print('\n' + '='*50)
+        print('结业证书 GUI 集成测试')
+        print('='*50)
+
+        test_certificate_gui_main_workflow()
+
         test_summary()
     finally:
         db_module.DB_PATH = original_path
@@ -2914,6 +3447,18 @@ if __name__ == '__main__':
             except:
                 pass
         export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '批量操作结果_*.csv'))
+        for f in export_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+        export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '结业证书列表_*.csv'))
+        for f in export_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+        export_files = glob.glob(os.path.join(os.path.dirname(__file__), 'exports', '批量生成结业证书结果_*.csv'))
         for f in export_files:
             try:
                 os.remove(f)

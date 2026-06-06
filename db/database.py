@@ -187,5 +187,54 @@ def init_database():
     )
     ''')
 
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS certificates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        certificate_no TEXT UNIQUE NOT NULL,
+        course_id INTEGER NOT NULL,
+        student_id INTEGER NOT NULL,
+        registration_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'issued',
+        issue_date TEXT NOT NULL,
+        generated_at TEXT NOT NULL,
+        voided_at TEXT,
+        void_reason TEXT,
+        remark TEXT,
+        operated_by TEXT DEFAULT '管理员',
+        FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE,
+        FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+        FOREIGN KEY (registration_id) REFERENCES registrations(id) ON DELETE SET NULL
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS certificate_batch_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id INTEGER NOT NULL,
+        operation_type TEXT NOT NULL,
+        total_count INTEGER NOT NULL,
+        success_count INTEGER NOT NULL,
+        failure_count INTEGER NOT NULL,
+        operated_by TEXT DEFAULT '管理员',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS certificate_batch_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_log_id INTEGER NOT NULL,
+        student_id INTEGER NOT NULL,
+        certificate_id INTEGER,
+        success INTEGER NOT NULL,
+        failure_reason TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (batch_log_id) REFERENCES certificate_batch_logs(id) ON DELETE CASCADE,
+        FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+        FOREIGN KEY (certificate_id) REFERENCES certificates(id) ON DELETE SET NULL
+    )
+    ''')
+
     conn.commit()
     conn.close()
