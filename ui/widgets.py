@@ -1262,35 +1262,24 @@ class CertificateManagementWidget(QWidget):
                 self.preview_and_generate(course_id)
 
     def preview_and_generate(self, course_id):
-        course = CourseService.get_course(course_id)
-        if not course:
-            QMessageBox.warning(self, '错误', '课程不存在')
-            return
+        try:
+            preview = CertificatePreviewDialog(course_id, self)
+            if preview.exec():
+                selected_ids = preview.get_selected_student_ids()
+                remark = preview.get_remark()
 
-        now = datetime.now()
-        end_time = datetime.fromisoformat(course['end_time'])
-        if now < end_time:
-            QMessageBox.warning(self, '提示', '课程尚未结束，不能生成结业证书')
-            return
+                if not selected_ids:
+                    QMessageBox.information(self, '提示', '未选择任何学员')
+                    return
 
-        preview = CertificatePreviewDialog(course_id, self)
-        if preview.exec():
-            selected_ids = preview.get_selected_student_ids()
-            remark = preview.get_remark()
+                reply = QMessageBox.question(
+                    self, '确认生成',
+                    f'确定要为选中的 {len(selected_ids)} 名学员生成结业证书吗？',
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
 
-            if not selected_ids:
-                QMessageBox.information(self, '提示', '未选择任何学员')
-                return
-
-            reply = QMessageBox.question(
-                self, '确认生成',
-                f'确定要为选中的 {len(selected_ids)} 名学员生成结业证书吗？',
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-
-            if reply == QMessageBox.Yes:
-                try:
+                if reply == QMessageBox.Yes:
                     result = CertificateService.batch_generate_certificates(
                         course_id=course_id,
                         student_ids=selected_ids,
@@ -1301,10 +1290,10 @@ class CertificateManagementWidget(QWidget):
 
                     result_dialog = CertificateBatchResultDialog(result, self)
                     result_dialog.exec()
-                except ValidationError as e:
-                    QMessageBox.warning(self, '生成失败', str(e))
-                except Exception as e:
-                    QMessageBox.warning(self, '系统错误', f'生成过程中发生错误：{e}')
+        except ValidationError as e:
+            QMessageBox.warning(self, '提示', str(e))
+        except Exception as e:
+            QMessageBox.warning(self, '系统错误', f'生成过程中发生错误：{e}')
 
     def batch_generate(self):
         if self.current_course_id:

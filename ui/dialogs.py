@@ -1934,7 +1934,7 @@ class CertificatePreviewDialog(QDialog):
             stats_layout.addStretch()
             self.summary_layout.addLayout(stats_layout)
 
-            eligible_students = self.preview_data['eligible_students']
+            eligible_students = self.preview_data['eligible']
             self.eligible_table.setRowCount(len(eligible_students))
             for row_idx, student in enumerate(eligible_students):
                 checkbox = QCheckBox()
@@ -1954,7 +1954,7 @@ class CertificatePreviewDialog(QDialog):
 
                 self.eligible_table.item(row_idx, 1).setData(Qt.UserRole, student['student_id'])
 
-            ineligible_students = self.preview_data['ineligible_students']
+            ineligible_students = self.preview_data['ineligible']
             self.ineligible_table.setRowCount(len(ineligible_students))
             for row_idx, student in enumerate(ineligible_students):
                 self.ineligible_table.setItem(row_idx, 0, QTableWidgetItem(student['name']))

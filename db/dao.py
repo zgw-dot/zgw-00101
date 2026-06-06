@@ -1146,6 +1146,27 @@ class CertificateDAO:
         conn.close()
         return row is not None
 
+    @staticmethod
+    def get_course_certificate_status(course_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT r.id as registration_id, r.status as registration_status,
+               r.course_id, r.student_id, r.registered_at,
+               s.name, s.employee_id, s.department, s.phone, s.email,
+               a.status as attendance_status, a.check_in_time, a.is_makeup,
+               c.id as certificate_id, c.certificate_no, c.status as certificate_status
+        FROM registrations r
+        JOIN students s ON r.student_id = s.id
+        LEFT JOIN attendances a ON r.course_id = a.course_id AND r.student_id = a.student_id
+        LEFT JOIN certificates c ON r.course_id = c.course_id AND r.student_id = c.student_id AND c.status = 'issued'
+        WHERE r.course_id=?
+        ORDER BY s.name
+        ''', (course_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows_to_dict_list(rows)
+
 
 class CertificateBatchLogDAO:
     @staticmethod

@@ -7,6 +7,7 @@ from .course_service import ValidationError
 
 
 class CertificateService:
+
     @staticmethod
     def _validate_course_ended(course):
         course_end = datetime.fromisoformat(course['end_time'])
@@ -15,26 +16,80 @@ class CertificateService:
             raise ValidationError('课程尚未结束，不能生成结业证书')
 
     @staticmethod
-    def _validate_student_registered(course_id, student_id):
-        registrations = RegistrationDAO.get_by_course_all_status(course_id)
-        reg = next((r for r in registrations if r['student_id'] == student_id), None)
-        if not reg:
-            raise ValidationError('该学员未报名此课程')
-        if reg['status'] == 'cancelled':
-            raise ValidationError('该学员已取消报名')
-        return reg
+    def _build_student_info(status_row):
+        return {
+            'student_id': status_row['student_id'],
+            'name': status_row['name'],
+            'employee_id': status_row['employee_id'],
+            'department': status_row.get('department', ''),
+            'registration_id': status_row['registration_id'],
+            'registration_status': status_row['registration_status']
+        }
 
     @staticmethod
-    def _validate_attendance(course_id, student_id):
-        attendances = AttendanceDAO.get_by_course(course_id)
-        att = next((a for a in attendances if a['student_id'] == student_id), None)
-        if not att or att['status'] != 'present':
-            raise ValidationError('该学员未出勤或出勤不达标')
+    def _check_single_eligibility(course_id, status_row, course_ended=True):
+        student_info = CertificateService._build_student_info(status_row)
+        failure_reasons = []
+
+        if not course_ended:
+            failure_reasons.append('课程尚未结束')
+
+        if status_row['registration_status'] == 'cancelled':
+            failure_reasons.append('已取消报名')
+
+        att_status = status_row.get('attendance_status')
+        if not att_status or att_status != 'present':
+            failure_reasons.append('缺勤或出勤不达标')
+        else:
+            student_info['attendance_status'] = att_status
+            student_info['check_in_time'] = status_row.get('check_in_time', '')
+
+        if status_row.get('certificate_id') is not None:
+            failure_reasons.append('已有有效证书')
+
+        eligible = len(failure_reasons) == 0
+        if not eligible:
+            student_info['failure_reasons'] = failure_reasons
+
+        return {
+            'student': student_info,
+            'eligible': eligible,
+            'failure_reasons': failure_reasons
+        }
 
     @staticmethod
-    def _validate_no_duplicate(course_id, student_id):
-        if CertificateDAO.exists_active(course_id, student_id):
-            raise ValidationError('该学员已有有效的结业证书')
+    def _build_preview_result(course_id, course, course_ended, ineligible_reason=None):
+        status_rows = CertificateDAO.get_course_certificate_status(course_id)
+
+        eligible_list = []
+        ineligible_list = []
+
+        for row in status_rows:
+            check_result = CertificateService._check_single_eligibility(
+                course_id, row, course_ended
+            )
+            if check_result['eligible']:
+                eligible_list.append(check_result['student'])
+            else:
+                ineligible_list.append(check_result['student'])
+
+        result = {
+            'course_id': course_id,
+            'course_title': course['title'],
+            'course_ended': course_ended,
+            'total_registered': len(status_rows),
+            'eligible_count': len(eligible_list),
+            'ineligible_count': len(ineligible_list),
+            'eligible': eligible_list,
+            'ineligible': ineligible_list,
+            'eligible_students': eligible_list,
+            'ineligible_students': ineligible_list
+        }
+
+        if ineligible_reason:
+            result['ineligible_reason'] = ineligible_reason
+
+        return result
 
     @staticmethod
     def get_eligible_students(course_id):
@@ -47,24 +102,15 @@ class CertificateService:
         except ValidationError:
             return []
 
-        registrations = RegistrationDAO.get_by_course(course_id)
-        attendances = AttendanceDAO.get_by_course(course_id)
-        att_map = {a['student_id']: a for a in attendances}
-
+        status_rows = CertificateDAO.get_course_certificate_status(course_id)
         eligible = []
-        for reg in registrations:
-            student_id = reg['student_id']
-            att = att_map.get(student_id)
-            if att and att['status'] == 'present' and not CertificateDAO.exists_active(course_id, student_id):
-                eligible.append({
-                    'student_id': student_id,
-                    'name': reg['name'],
-                    'employee_id': reg['employee_id'],
-                    'department': reg.get('department', ''),
-                    'registration_id': reg['id'],
-                    'attendance_status': att['status'],
-                    'check_in_time': att.get('check_in_time', '')
-                })
+        for row in status_rows:
+            if row['registration_status'] != 'cancelled':
+                check_result = CertificateService._check_single_eligibility(
+                    course_id, row, course_ended=True
+                )
+                if check_result['eligible']:
+                    eligible.append(check_result['student'])
 
         return eligible
 
@@ -74,67 +120,21 @@ class CertificateService:
         if not course:
             raise ValidationError('课程不存在')
 
-        result = {
-            'course_id': course_id,
-            'course_title': course['title'],
-            'course_ended': False,
-            'total_registered': 0,
-            'eligible_count': 0,
-            'ineligible_count': 0,
-            'eligible_students': [],
-            'ineligible_students': []
-        }
+        course_ended = True
+        ineligible_reason = None
 
         try:
             CertificateService._validate_course_ended(course)
-            result['course_ended'] = True
         except ValidationError as e:
-            result['course_ended'] = False
-            result['ineligible_reason'] = str(e)
+            course_ended = False
+            ineligible_reason = str(e)
 
-        registrations = RegistrationDAO.get_by_course_all_status(course_id)
-        attendances = AttendanceDAO.get_by_course(course_id)
-        att_map = {a['student_id']: a for a in attendances}
-
-        result['total_registered'] = len(registrations)
-
-        for reg in registrations:
-            student_id = reg['student_id']
-            student_info = {
-                'student_id': student_id,
-                'name': reg['name'],
-                'employee_id': reg['employee_id'],
-                'department': reg.get('department', ''),
-                'registration_id': reg['id'],
-                'registration_status': reg['status']
-            }
-
-            reasons = []
-
-            if reg['status'] == 'cancelled':
-                reasons.append('已取消报名')
-
-            att = att_map.get(student_id)
-            if not att or att['status'] != 'present':
-                reasons.append('缺勤或出勤不达标')
-
-            if CertificateDAO.exists_active(course_id, student_id):
-                reasons.append('已有有效证书')
-
-            if reasons:
-                student_info['failure_reasons'] = reasons
-                result['ineligible_students'].append(student_info)
-                result['ineligible_count'] += 1
-            else:
-                student_info['attendance_status'] = att['status'] if att else 'pending'
-                student_info['check_in_time'] = att.get('check_in_time', '') if att else ''
-                result['eligible_students'].append(student_info)
-                result['eligible_count'] += 1
-
-        return result
+        return CertificateService._build_preview_result(
+            course_id, course, course_ended, ineligible_reason
+        )
 
     @staticmethod
-    def issue_certificate(course_id, student_id, remark='', operated_by='管理员'):
+    def _validate_issue(course_id, student_id):
         course = CourseDAO.get_by_id(course_id)
         if not course:
             raise ValidationError('课程不存在')
@@ -145,9 +145,26 @@ class CertificateService:
 
         CertificateService._validate_course_ended(course)
 
-        reg = CertificateService._validate_student_registered(course_id, student_id)
-        CertificateService._validate_attendance(course_id, student_id)
-        CertificateService._validate_no_duplicate(course_id, student_id)
+        registrations = RegistrationDAO.get_by_course_all_status(course_id)
+        reg = next((r for r in registrations if r['student_id'] == student_id), None)
+        if not reg:
+            raise ValidationError('该学员未报名此课程')
+        if reg['status'] == 'cancelled':
+            raise ValidationError('该学员已取消报名')
+
+        attendances = AttendanceDAO.get_by_course(course_id)
+        att = next((a for a in attendances if a['student_id'] == student_id), None)
+        if not att or att['status'] != 'present':
+            raise ValidationError('该学员未出勤或出勤不达标')
+
+        if CertificateDAO.exists_active(course_id, student_id):
+            raise ValidationError('该学员已有有效的结业证书')
+
+        return course, student, reg
+
+    @staticmethod
+    def issue_certificate(course_id, student_id, remark='', operated_by='管理员'):
+        course, student, reg = CertificateService._validate_issue(course_id, student_id)
 
         certificate = CertificateDAO.create(
             course_id=course_id,
@@ -179,12 +196,12 @@ class CertificateService:
         preview = CertificateService.preview_generation(course_id)
 
         if student_ids is None:
-            eligible_ids = [s['student_id'] for s in preview['eligible_students']]
+            eligible_ids = [s['student_id'] for s in preview['eligible']]
         else:
-            eligible_ids = [s['student_id'] for s in preview['eligible_students']
+            eligible_ids = [s['student_id'] for s in preview['eligible']
                             if s['student_id'] in student_ids]
 
-        total_count = len(eligible_ids) + len(preview['ineligible_students'])
+        total_count = len(eligible_ids) + len(preview['ineligible'])
         if student_ids is not None:
             total_count = len(student_ids)
 
@@ -236,6 +253,7 @@ class CertificateService:
 
         CertificateBatchLogDAO.update_counts(batch_log_id, success_count, failure_count)
 
+        items = CertificateBatchItemDAO.get_by_batch_log(batch_log_id)
         return {
             'batch_log_id': batch_log_id,
             'course_id': course_id,
@@ -243,7 +261,7 @@ class CertificateService:
             'total_count': total_count,
             'success_count': success_count,
             'failure_count': failure_count,
-            'items': CertificateBatchItemDAO.get_by_batch_log(batch_log_id)
+            'items': items
         }
 
     @staticmethod
@@ -257,8 +275,18 @@ class CertificateService:
             raise ValidationError('学员不存在')
 
         CertificateService._validate_course_ended(course)
-        CertificateService._validate_student_registered(course_id, student_id)
-        CertificateService._validate_attendance(course_id, student_id)
+
+        registrations = RegistrationDAO.get_by_course_all_status(course_id)
+        reg = next((r for r in registrations if r['student_id'] == student_id), None)
+        if not reg:
+            raise ValidationError('该学员未报名此课程')
+        if reg['status'] == 'cancelled':
+            raise ValidationError('该学员已取消报名')
+
+        attendances = AttendanceDAO.get_by_course(course_id)
+        att = next((a for a in attendances if a['student_id'] == student_id), None)
+        if not att or att['status'] != 'present':
+            raise ValidationError('该学员未出勤或出勤不达标')
 
         existing_certs = CertificateDAO.get_by_course_and_student(course_id, student_id)
         issued_certs = [c for c in existing_certs if c['status'] == 'issued']
@@ -281,7 +309,7 @@ class CertificateService:
         new_cert = CertificateDAO.create(
             course_id=course_id,
             student_id=student_id,
-            registration_id=existing_certs[0]['registration_id'] if existing_certs else None,
+            registration_id=existing_certs[0]['registration_id'] if existing_certs else reg['id'],
             status='issued',
             remark=remark,
             operated_by=operated_by
@@ -321,7 +349,7 @@ class CertificateService:
             student_id=cert['student_id']
         )
 
-        return True
+        return CertificateDAO.get_by_id(cert_id)
 
     @staticmethod
     def get_certificate(cert_id):

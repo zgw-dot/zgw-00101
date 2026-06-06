@@ -547,6 +547,30 @@ A: 根据操作类型不同略有差异，通用包含：
 
 ## 10. 结业证书管理
 
+### 10.0 证书链路验证命令
+
+#### 运行核心功能测试
+```bash
+cd d:\workSpace\AI__SPACE\02-label\zgw-00101
+python test_certificate_core.py
+```
+
+#### 运行回归测试（推荐）
+```bash
+cd d:\workSpace\AI__SPACE\02-label\zgw-00101
+python test_certificate_regression.py
+```
+
+回归测试覆盖以下场景：
+1. ✅ 统一返回字段命名验证（新字段 `eligible`/`ineligible` + 兼容字段 `eligible_students`/`ineligible_students`）
+2. ✅ 批量生成部分成功部分失败（缺勤、已取消、已有证书三种失败场景）
+3. ✅ 补发后旧证书自动作废
+4. ✅ 作废原因长度校验（至少 5 字符）、重复作废拦截
+5. ✅ 跨重启 SQLite 数据持久化（证书、批量日志、批量明细）
+6. ✅ GUI 入口字段一致性（确保界面调用不会因字段不一致崩溃）
+7. ✅ 导出服务字段兼容性
+8. ✅ 校验逻辑一致性（单条校验与批量预览校验规则一致）
+
 ### 10.1 功能概述
 
 结业证书管理模块允许管理员在课程结束后，根据学员的出勤记录批量生成结业证书。支持单个学员的证书补发和作废操作。所有证书信息持久化存储到 SQLite 数据库，关闭重启后数据保持一致。
@@ -697,6 +721,83 @@ A: 在结业证书管理页面切换到「批量操作记录」标签页，可�
 
 **Q: 导出的 CSV 文件在哪里？**
 A: 导出目录是程序目录下的 `exports/` 文件夹，文件名包含时间戳。
+
+### 10.12 重构记录与迁移说明
+
+#### 2026-06-06 结业证书链路重构
+
+**重构目标：**
+- 拆分校验逻辑，统一返回字段命名
+- 整理 DAO 层职责，避免服务层重复数据拼接
+- 移除 UI 层业务规则，只保留适配逻辑
+
+**核心改动：**
+
+1. **services/certificate_service.py**
+   - 新增 `_build_student_info()` - 统一构造学员信息结构
+   - 新增 `_check_single_eligibility()` - 单条资格校验核心逻辑，返回结构化结果
+   - 新增 `_build_preview_result()` - 统一构造预览结果
+   - 新增 `_validate_issue()` - 单条证书生成前的完整校验
+   - `preview_generation()` 返回字段统一，同时保留兼容字段
+   - `void_certificate()` 现在返回更新后的证书对象（原返回 `True`）
+
+2. **db/dao.py**
+   - 新增 `CertificateDAO.get_course_certificate_status()` - 一次性查询课程下所有学员的报名、出勤、证书状态，避免服务层多次查询拼接
+
+3. **ui/widgets.py**
+   - 移除 `preview_and_generate()` 中的课程结束时间校验（移至服务层统一处理）
+   - 异常捕获统一处理服务层抛出的业务规则异常
+
+4. **ui/dialogs.py**
+   - `CertificatePreviewDialog` 改用新统一字段名 `eligible`/`ineligible`
+
+**兼容字段（保留至下次重构）：**
+
+| 新字段名 | 兼容字段名（旧） | 说明 |
+|---------|------------------|------|
+| `eligible` | `eligible_students` | 符合条件学员列表，两者指向同一列表对象 |
+| `ineligible` | `ineligible_students` | 不符合条件学员列表，两者指向同一列表对象 |
+
+**返回结构规范：**
+
+`preview_generation()` 返回结构：
+```python
+{
+    'course_id': int,
+    'course_title': str,
+    'course_ended': bool,
+    'total_registered': int,
+    'eligible_count': int,
+    'ineligible_count': int,
+    'eligible': [ ... ],           # 新字段（推荐使用）
+    'ineligible': [ ... ],         # 新字段（推荐使用）
+    'eligible_students': [ ... ],  # 兼容字段
+    'ineligible_students': [ ... ],# 兼容字段
+    'ineligible_reason': str       # 可选，课程未结束时的原因
+}
+```
+
+学员信息结构：
+```python
+{
+    'student_id': int,
+    'name': str,
+    'employee_id': str,
+    'department': str,
+    'registration_id': int,
+    'registration_status': str,
+    # 符合条件时额外字段：
+    'attendance_status': str,
+    'check_in_time': str,
+    # 不符合条件时额外字段：
+    'failure_reasons': [str, ...]
+}
+```
+
+**迁移建议：**
+- 新代码应使用 `eligible` 和 `ineligible` 字段
+- 旧代码可继续使用 `eligible_students` 和 `ineligible_students`，两者值完全一致
+- 下次重构时将移除兼容字段
 
 ---
 

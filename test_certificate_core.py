@@ -58,7 +58,7 @@ not_ended_course = {
     'start_time': (datetime.now() + timedelta(days=1)).isoformat(),
     'end_time': (datetime.now() + timedelta(days=1, hours=2)).isoformat(),
     'capacity': 5,
-    'registration_deadline': (datetime.now() + timedelta(days=1)).isoformat(),
+    'registration_deadline': (datetime.now() + timedelta(days=2)).isoformat(),
     'status': 'published'
 }
 not_ended_id = CourseService.create_course(not_ended_course)
